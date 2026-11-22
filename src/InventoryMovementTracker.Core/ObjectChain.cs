@@ -22,13 +22,7 @@ public static class ObjectChain
         for (var t = 0; t < n; t++)
         {
             predictive[t] = law;
-            var next = new double[k];
-            for (var j = 0; j < k; j++)
-            {
-                for (var i = 0; i < k; i++) next[j] += law[i] * Kernel(steps[t], i, j);
-                next[j] *= Emission(steps[t], j);
-            }
-            law = filtered[t] = Normalise(next, $"at step {t}");
+            law = filtered[t] = Filter(law, steps[t], $"at step {t}");
         }
 
         var smoothed = new double[n][];
@@ -42,6 +36,18 @@ public static class ObjectChain
             beta = Normalise(back, $"at step {t}");   // cannot be zero once the forward pass has found a possible state
         }
         return (predictive, smoothed);
+    }
+
+    /// <summary>One forward step: the normalised law after <paramref name="step"/>, from the law before it.</summary>
+    internal static double[] Filter(double[] law, ChainStep step, string where)
+    {
+        var next = new double[law.Length];
+        for (var j = 0; j < law.Length; j++)
+        {
+            for (var i = 0; i < law.Length; i++) next[j] += law[i] * Kernel(step, i, j);
+            next[j] *= Emission(step, j);
+        }
+        return Normalise(next, where);
     }
 
     private static double Kernel(ChainStep step, int from, int to) => step.Kernel?[from, to] ?? (from == to ? 1 : 0);
