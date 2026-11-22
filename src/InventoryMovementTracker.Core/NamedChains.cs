@@ -1,77 +1,140 @@
 namespace InventoryMovementTracker.Core;
 
 /// <summary>
-/// Turns the named evidence (moves with a geid, body sightings) into one <see cref="ObjectChain"/> per geid: P0.1 §3
-/// and §4, reduced to mandate B4b. A geid's states are the holders its own evidence names, plus Out of sight, where
-/// it starts. Out of scope: the lost-queue rule of §4 (B9), births (B5), continuous hazards (B6), resets (B7) and
-/// moves by class (B9).
+/// Turns the evidence into one <see cref="ObjectChain"/> per geid: P0.1 §3, §4 and §6, reduced to mandates B4b and
+/// B9b. A geid's states are the holders its own evidence names, plus Out of sight, where it starts, plus the targets
+/// of the class moves it may have followed.
+/// <para>
+/// A move by class (no geid) is split with <see cref="ClassMoveSplit"/> among the named geids of its class that may
+/// be at its source, so it needs every geid's current filter at once: one online forward pass runs over all the
+/// evidence in time order and fixes each class move's kernels there. Each chain is then smoothed with those kernels as
+/// they are. This frozen coupling is the approximation of decision B1, constraint 3: what a later step teaches about
+/// one geid does not revise how an earlier class move was shared with the others.
+/// </para>
+/// <para>
+/// Arrival order at the source, most recent first, is approximated by the time of each geid's last step that targeted
+/// that source. The units the named geids do not supply (lots, carriers, Out of sight, births) are out of scope (B5);
+/// only their expected count is returned. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5),
+/// continuous hazards (B6) and resets (B7).
+/// </para>
 /// </summary>
 public static class NamedChains
 {
     private static readonly HashSet<string> NamedMoves = ["Store", "Interaction", "StoreItem", "Drop", "Death"];
+    private static readonly HashSet<string> NotClassMoves = ["Split", "Stack", "StackAll", "Sort", "AmmoRepool", "Buy", "MoveAll"];
     private static readonly HashSet<string> Sources = ["Container", "Location", "Equipped"];   // Invalid: no likelihood
     private static readonly HashSet<string> Targets = ["Container", "Location", "Equipped", "Corpse", "World"];
 
-    /// <returns>Each geid's steps in evidence order: by ts, then moves before listings, then provenance.</returns>
-    public static IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Run(
+    /// <returns>
+    /// Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
+    /// included. MeanShortfall: the expected number of units per class move that no named geid supplied.
+    /// </returns>
+    public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall) Run(
         IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta)
     {
-        // A move that succeeded or got no answer weighs its source, then jumps to its target; a Drop's target is the
-        // floor under its key as stored. failed: nothing. lost: the source only, no jump; the §4 queue rule waits for B9.
-        var evidence = moves
+        // A named move that succeeded or got no answer weighs its source, then jumps to its target; a Drop's target is
+        // the floor under its key as stored. failed: nothing. lost: the source only, no jump; the §4 queue rule waits.
+        // A seen line, placeholders aside, is named evidence: a jump to the body, or to its parent container.
+        var moveList = moves.ToList();
+        var seen = sightings.Where(s => !s.Placeholder).ToList();
+        var named = moveList
             .Where(m => m.Geid is not null && NamedMoves.Contains(m.MoveType) && m.Result != "failed")
-            .Select(m => (Geid: m.Geid!, m.Ts, Phase: 0, m.Provenance, Vanish: false,
-                Source: Sources.Contains(m.SourceKind ?? "") ? Of(m.SourceKind!, m.SourceKey) : null,
-                Target: m.Result != "lost" && Targets.Contains(m.TargetKind ?? "") ? Of(m.TargetKind!, m.TargetKey) : null))
+            .Select(m => (Geid: m.Geid!, Class: m.ItemClass, m.Ts, Phase: 0, m.Provenance, Source: SourceOf(m),
+                Target: m.Result != "lost" ? TargetOf(m) : null))
+            .Concat(seen.Select(s => (s.Geid, Class: s.ClassName, s.Ts, Phase: 1, s.Provenance, Source: (Holder?)null,
+                Target: (Holder?)(s.ParentGeid is { } parent ? new Holder("Container", parent) : Holder.Body))))
             .ToList();
 
-        // A seen line, placeholders aside, is named evidence: a jump to the body, or to its parent container.
-        var seen = sightings.Where(s => !s.Placeholder).ToList();
-        evidence.AddRange(seen.Select(s => (s.Geid, s.Ts, Phase: 1, s.Provenance, Vanish: false, Source: (Holder?)null,
-            Target: (Holder?)(s.ParentGeid is { } parent ? new Holder("Container", parent) : Holder.Body))));
-
-        var states = evidence.GroupBy(e => e.Geid).ToDictionary(g => g.Key, g => g
+        var holders = named.GroupBy(e => e.Geid).ToDictionary(g => g.Key, g => g
             .SelectMany(e => new[] { e.Source, e.Target }).OfType<Holder>().Prepend(Holder.OutOfSight).Distinct().ToList());
+        var byClass = named.GroupBy(e => e.Geid).ToLookup(g => g.First().Class, g => g.Key);
+        var law = holders.ToDictionary(kv => kv.Key, kv => (double[])[1, .. new double[kv.Value.Count - 1]]);
+        var steps = holders.ToDictionary(kv => kv.Key, _ => new List<(Provenance P, string Ts, Holder? Source, Func<List<Holder>, ChainStep> Kernel)>());
+        var arrived = new Dictionary<(string, Holder), int>();
+        var shortfalls = new List<double>();
 
-        // A burst with the Body_ItemPort line is a complete listing: a geid with the body among its states that the
-        // listing leaves out goes from the body to Out of sight with 1 − δ.
+        void Apply(string geid, int seq, Provenance p, string ts, Holder? source, Holder? target, Func<List<Holder>, ChainStep> kernel)
+        {
+            if (target is not null && !holders[geid].Contains(target)) { holders[geid].Add(target); law[geid] = [.. law[geid], 0]; }
+            law[geid] = ObjectChain.Filter(law[geid], kernel(holders[geid]), $"at {ts}");
+            steps[geid].Add((p, ts, source, kernel));
+            if (target is not null) arrived[(geid, target)] = seq;
+        }
+
+        var events = named.Select(e => (e.Ts, e.Phase, e.Provenance, Run: (Action<int>)(seq => Apply(e.Geid, seq, e.Provenance, e.Ts,
+            e.Source, e.Target, h => ChainStep.Move(h.Count, At(h, e.Source), At(h, e.Target), epsilon))))).ToList();
+
+        // A burst with the Body_ItemPort line is a complete listing: a geid that may be on the body and that the listing
+        // leaves out goes from the body to Out of sight with 1 − δ.
         foreach (var burst in seen.GroupBy(s => (s.Provenance.SessionId, s.BurstId)))
         {
             if (burst.FirstOrDefault(s => s.Port == "Body_ItemPort") is not { } body) continue;
             var listed = burst.Select(s => s.Geid).ToHashSet();
-            evidence.AddRange(states.Where(kv => kv.Value.Contains(Holder.Body) && !listed.Contains(kv.Key))
-                .Select(kv => (kv.Key, body.Ts, 1, body.Provenance, true, (Holder?)null, (Holder?)null)));
+            events.Add((body.Ts, 1, body.Provenance, seq =>
+            {
+                foreach (var geid in law.Keys.Where(g => !listed.Contains(g) && At(holders[g], Holder.Body) is { } b && law[g][b] > 0).ToList())
+                    Apply(geid, seq, body.Provenance, body.Ts, null, null, h => Shift(h, Holder.Body, Holder.OutOfSight, 1 - delta));
+            }));
         }
+
+        // A move by class: no geid, succeeded or no answer, n > 0 units from a real source. Candidate o moves with
+        // r_o = Moved_o / p_o, where p_o = P(X_o = s) on its current filter; no source likelihood, since it is not named.
+        foreach (var m in moveList.Where(m => m.Geid is null && m.Result is null or "succeed" && m.Amount > 0
+                     && !NotClassMoves.Contains(m.MoveType) && !m.MoveType.StartsWith("Query", StringComparison.Ordinal)))
+        {
+            if (SourceOf(m) is not { } s || TargetOf(m) is not { } t) continue;
+            events.Add((m.Ts, 0, m.Provenance, seq =>
+            {
+                var candidates = byClass[m.ItemClass].Where(g => At(holders[g], s) is { } i && law[g][i] > 0)
+                    .OrderByDescending(g => arrived.GetValueOrDefault((g, s), -1)).ToList();
+                var presence = candidates.Select(g => law[g][holders[g].IndexOf(s)]).ToArray();
+                var (moved, shortfall) = ClassMoveSplit.Split(presence, (int)m.Amount);
+                shortfalls.Add(shortfall.Select((p, k) => p * k).Sum());
+                for (var i = 0; i < candidates.Count; i++)
+                {
+                    var r = Math.Min(1, moved[i] / presence[i]);   // presence > 0: candidates hold s with some mass
+                    Apply(candidates[i], seq, m.Provenance, m.Ts, null, t, h => Shift(h, s, t, r));
+                }
+            }));
+        }
+
+        var ordered = events.OrderBy(e => e.Ts, StringComparer.Ordinal).ThenBy(e => e.Phase)
+            .ThenBy(e => e.Provenance.SessionId).ThenBy(e => e.Provenance.LineOffset).ThenBy(e => e.Provenance.ItemIx).ToList();
+        for (var seq = 0; seq < ordered.Count; seq++) ordered[seq].Run(seq);
 
         var chains = new Dictionary<string, IReadOnlyList<ChainEntry>>();
-        foreach (var geid in evidence
-            .OrderBy(e => e.Ts, StringComparer.Ordinal).ThenBy(e => e.Phase)
-            .ThenBy(e => e.Provenance.SessionId).ThenBy(e => e.Provenance.LineOffset).ThenBy(e => e.Provenance.ItemIx)
-            .GroupBy(e => e.Geid))
+        foreach (var (geid, list) in steps)
         {
-            var holders = states[geid.Key];
-            var steps = geid.SkipWhile(e => e.Vanish).ToList();   // a listing before the first evidence says nothing
-            int? At(Holder? h) => h is null ? null : holders.IndexOf(h);
-            var (predictive, smoothed) = ObjectChain.Run([1, .. new double[holders.Count - 1]], [.. steps.Select(e => e.Vanish
-                ? LeaveBody(holders.Count, holders.IndexOf(Holder.Body), delta)
-                : ChainStep.Move(holders.Count, At(e.Source), At(e.Target), epsilon))]);
-
-            IReadOnlyDictionary<Holder, double> Law(double[] p) => holders.Zip(p).ToDictionary(x => x.First, x => x.Second);
-            chains[geid.Key] = [.. steps.Select((e, t) => new ChainEntry(e.Provenance, e.Ts, e.Source,
-                t > 0 && e.Source?.Kind is "Container" or "Location" ? predictive[t][holders.IndexOf(e.Source!)] : null,
+            var h = holders[geid];
+            var (predictive, smoothed) = ObjectChain.Run([1, .. new double[h.Count - 1]], [.. list.Select(e => e.Kernel(h))]);
+            IReadOnlyDictionary<Holder, double> Law(double[] p) => h.Zip(p).ToDictionary(x => x.First, x => x.Second);
+            chains[geid] = [.. list.Select((e, t) => new ChainEntry(e.P, e.Ts, e.Source,
+                t > 0 && e.Source?.Kind is "Container" or "Location" ? predictive[t][h.IndexOf(e.Source!)] : null,
                 Law(predictive[t]), Law(smoothed[t])))];
         }
-        return chains;
+        return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average());
     }
+
+    // §4: a Store never names its source, which is always the player's hand or body.
+    private static Holder? SourceOf(MoveEvidence m) =>
+        m.MoveType == "Store" && m.SourceKind == "Invalid" ? Holder.Body
+        : Sources.Contains(m.SourceKind ?? "") ? Of(m.SourceKind!, m.SourceKey) : null;
+
+    private static Holder? TargetOf(MoveEvidence m) => Targets.Contains(m.TargetKind ?? "") ? Of(m.TargetKind!, m.TargetKey) : null;
 
     private static Holder Of(string kind, string? key) => kind == "Equipped" ? Holder.Body : new Holder(kind, key ?? "");
 
-    // Out of sight is state 0. Every other state stays where it is.
-    private static ChainStep LeaveBody(int k, int body, double delta)
+    private static int? At(List<Holder> holders, Holder? holder) =>
+        holder is not null && holders.IndexOf(holder) is >= 0 and var i ? i : null;
+
+    // On row `from`, stay with 1 − r or go to `to` with r. Every other state stays where it is.
+    private static ChainStep Shift(List<Holder> holders, Holder from, Holder to, double r)
     {
-        var m = new double[k, k];
-        for (var i = 0; i < k; i++) m[i, i] = 1;
-        (m[body, body], m[body, 0]) = (delta, 1 - delta);
+        var m = new double[holders.Count, holders.Count];
+        for (var i = 0; i < holders.Count; i++) m[i, i] = 1;
+        int f = holders.IndexOf(from), t = holders.IndexOf(to);
+        m[f, f] -= r;
+        m[f, t] += r;
         return new ChainStep(m, null);
     }
 }
