@@ -28,6 +28,8 @@ public static class Scoring
     /// <summary>95% interval (percentiles 2.5 and 97.5) of the mean of lossA - lossB, resampling checks by index.</summary>
     public static (double Low, double High) PairedBootstrap(IReadOnlyList<double> lossA, IReadOnlyList<double> lossB, int draws = 10_000, int seed = 12345)
     {
+        if (lossA.Count != lossB.Count || lossA.Count == 0)
+            throw new ArgumentException("Loss lists must be non-empty and of equal length.");
         var diff = lossA.Zip(lossB, (a, b) => a - b).ToArray();
         var rng = new Random(seed);
         var means = new double[draws];

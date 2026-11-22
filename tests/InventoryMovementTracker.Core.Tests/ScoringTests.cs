@@ -70,7 +70,35 @@ public sealed class ScoringTests
         var first = Scoring.PairedBootstrap(a, b, 1000);
 
         Assert.Equal(first, Scoring.PairedBootstrap(a, b, 1000));
-        Assert.True(first.Low < 0.25 && 0.25 < first.High); // mean difference is exactly 0.25
+        Assert.True(first.Low < 1.3 / 6 && 1.3 / 6 < first.High); // differences sum to 1.3
+    }
+
+    [Fact]
+    public void Bootstrap_rejects_unequal_or_empty_lists()
+    {
+        Assert.Throws<ArgumentException>(() => Scoring.PairedBootstrap([0.1, 0.2], [0.1]));
+        Assert.Throws<ArgumentException>(() => Scoring.PairedBootstrap([], []));
+    }
+
+    [Fact]
+    public void Brier_and_LogLoss_throw_on_empty_input()
+    {
+        Assert.Throws<InvalidOperationException>(() => Scoring.Brier([]));
+        Assert.Throws<InvalidOperationException>(() => Scoring.LogLoss([]));
+    }
+
+    [Fact]
+    public void LogLoss_clips_zero_to_the_lower_bound() =>
+        Assert.Equal(6.907755279, Scoring.LogLoss([(0.0, 1)]), 8); // -ln(0.001)
+
+    [Fact]
+    public void Reliability_bin_boundaries()
+    {
+        var bins = Scoring.Reliability([(0.3, 1), (0.7, 1), (0.0, 0)]);
+
+        Assert.Equal(1, bins[3].Count);
+        Assert.Equal(1, bins[7].Count);
+        Assert.Equal(1, bins[0].Count);
     }
 
     [Fact]
