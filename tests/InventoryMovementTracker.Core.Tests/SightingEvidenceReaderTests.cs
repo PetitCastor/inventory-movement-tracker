@@ -26,7 +26,7 @@ public sealed class SightingEvidenceReaderTests : IDisposable
         INSERT INTO session(id) VALUES (1), (2);
         INSERT INTO attachment_sighting VALUES (2, 50, '2026-11-02T10:00:00.1234567Z', '9', 'rifle', 'hand', 7, 'p1', 1);
         INSERT INTO attachment_sighting VALUES (1, 900, '2026-11-01T10:00:00.0000000Z', '1', 'helmet', 'head', 3, NULL, 0);
-        INSERT INTO attachment_sighting VALUES (2, 20, '2026-11-01T10:00:00.0000000Z', '2', 'boots', 'feet', 3, NULL, 0);
+        INSERT INTO attachment_sighting VALUES (2, 20, '2026-10-31T10:00:00.0000000Z', '2', 'boots', 'feet', 3, NULL, 0);
         INSERT INTO attachment_sighting VALUES (1, 100, '2026-11-01T10:00:00.0000000Z', '3', 'visor', 'face', 3, NULL, 0);
         """;
 
@@ -61,7 +61,7 @@ public sealed class SightingEvidenceReaderTests : IDisposable
         var rows = SightingEvidenceReader.Read(_path);
 
         Assert.Equal(
-            [new Provenance(1, 100, 0), new Provenance(1, 900, 0), new Provenance(2, 20, 0), new Provenance(2, 50, 0)],
+            [new Provenance(2, 20, 0), new Provenance(1, 100, 0), new Provenance(1, 900, 0), new Provenance(2, 50, 0)],
             rows.Select(r => r.Provenance));
         Assert.Null(rows[0].ParentGeid);
         Assert.False(rows[0].Placeholder);
