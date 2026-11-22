@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/InventoryMovementTracker.Core/InventoryMovementTracker.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/InventoryMovementTracker.Core.Tests/InventoryMovementTracker.Core.Tests.csproj" />
+  </Folder>
+</Solution>
