@@ -7,7 +7,12 @@ public static class MoveEvidenceReader
     public static IReadOnlyList<MoveEvidence> Read(string path)
     {
         // Pooling off so the file is released on dispose; the old database is evidence, never written.
-        using var conn = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
+        using var conn = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+        }.ConnectionString);
         conn.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
@@ -21,10 +26,11 @@ public static class MoveEvidenceReader
         while (r.Read())
             rows.Add(new MoveEvidence(
                 new Provenance(r.GetInt64(0), r.GetInt64(1), r.GetInt64(2)),
-                r.GetString(3), r.GetString(4), r.GetString(5), r.GetValue(6) as string, r.GetInt64(7),
-                r.GetValue(8) as string, r.GetValue(9) as string, r.GetValue(10) as string, r.GetValue(11) as string,
-                r.GetValue(12) as string, r.GetValue(13) as string,
+                r.GetString(3), r.GetString(4), r.GetString(5), Text(r, 6), r.GetInt64(7),
+                Text(r, 8), Text(r, 9), Text(r, 10), Text(r, 11), Text(r, 12), Text(r, 13),
                 r.IsDBNull(14) ? null : r.GetDouble(14)));
         return rows;
     }
+
+    private static string? Text(SqliteDataReader r, int i) => r.IsDBNull(i) ? null : r.GetString(i);
 }
