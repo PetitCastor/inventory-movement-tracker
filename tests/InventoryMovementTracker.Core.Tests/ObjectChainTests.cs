@@ -6,15 +6,31 @@ public sealed class ObjectChainTests
 {
     private const double Eps = 0.01;
 
-    // P0.1 §4: M = diag(source likelihood) · J_h, with J_h[y, j] = ε·[y = j] + (1 − ε)·[j = h].
-    // The source likelihood is 1 − ε if X = source, else ε; no source means a plain jump.
-    private static double[,] Move(int k, int? source, int h)
+    private static double[,] Move(int k, int? source, int h) => ChainStep.Move(k, source, h, Eps).Kernel!;
+
+    [Fact]
+    public void The_move_kernel_weighs_the_source_then_jumps()
     {
-        var m = new double[k, k];
-        for (var y = 0; y < k; y++)
-            for (var j = 0; j < k; j++)
-                m[y, j] = (source is null ? 1 : y == source ? 1 - Eps : Eps) * ((y == j ? Eps : 0) + (j == h ? 1 - Eps : 0));
-        return m;
+        // P0.1 §4: M = diag(source likelihood) · J_h, with J_h[y, j] = ε·[y = j] + (1 − ε)·[j = h], written out for
+        // a move 0 → 2 over 3 states with ε = 0.01. Row y is the source likelihood (0.99 or 0.01) times J_2's row y.
+        double[,] expected =
+        {
+            { 0.99 * 0.01, 0, 0.99 * 0.99 },
+            { 0, 0.01 * 0.01, 0.01 * 0.99 },
+            { 0, 0, 0.01 * 1.00 },
+        };
+
+        AssertSame(expected, ChainStep.Move(3, source: 0, target: 2, Eps).Kernel!);
+        AssertSame(new double[,] { { 0.01, 0.99 }, { 0, 1 } }, ChainStep.Move(2, source: null, target: 1, Eps).Kernel!);
+        AssertSame(new double[,] { { 0.99, 0 }, { 0, 0.01 } }, ChainStep.Move(2, source: 0, target: null, Eps).Kernel!);
+    }
+
+    private static void AssertSame(double[,] expected, double[,] actual)
+    {
+        Assert.Equal(expected.GetLength(0), actual.GetLength(0));
+        Assert.Equal(expected.GetLength(1), actual.GetLength(1));
+        for (var i = 0; i < expected.GetLength(0); i++)
+            for (var j = 0; j < expected.GetLength(1); j++) Assert.Equal(expected[i, j], actual[i, j], 1e-15);
     }
 
     // The oracle: sums the weight of every trajectory x_{-1}, x_0, ..., x_{n-1}, with no recursion shared with the code.
