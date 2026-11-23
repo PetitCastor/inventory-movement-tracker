@@ -77,7 +77,7 @@ public static class NamedChains
         {
             if (hazards is null || pending.ContainsKey(geid)) return;
             var now = DateTimeOffset.Parse(ts, CultureInfo.InvariantCulture);
-            var hours = lastTs.TryGetValue(geid, out var last) ? (now - last).TotalHours : 0;
+            var hours = lastTs.TryGetValue(geid, out var last) ? Math.Max(0, (now - last).TotalHours) : 0;
             lastTs[geid] = now;
             pending[geid] = h => DecayStep(h, hazards, classOf[geid], hours);
             law[geid] = ObjectChain.Filter(law[geid], pending[geid](holders[geid]), $"at {ts}");
@@ -187,7 +187,7 @@ public static class NamedChains
         for (var i = 0; i < holders.Count; i++)
         {
             var h = holders[i];
-            var rate = h == Holder.OutOfSight ? 0 : h.Kind == "World" ? rates.Despawn
+            var rate = h.Kind == "World" ? rates.Despawn
                 : h.Kind != "Location" && Consumables.Any(p => cls.StartsWith(p, StringComparison.Ordinal)) ? rates.Consumption : rates.Leak;
             var stay = Math.Exp(-rate * hours);
             m[i, i] += stay;
