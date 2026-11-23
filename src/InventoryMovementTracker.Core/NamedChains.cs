@@ -7,16 +7,19 @@ namespace InventoryMovementTracker.Core;
 /// B9b. A geid's states are the holders its own evidence names, plus Out of sight, where it starts, plus the targets
 /// of the class moves it may have followed.
 /// <para>
-/// A move by class (no geid) is split with <see cref="ClassMoveSplit"/> among the named geids of its class that may
-/// be at its source, so it needs every geid's current filter at once: one online forward pass runs over all the
-/// evidence in time order and fixes each class move's kernels there. Each chain is then smoothed with those kernels as
+/// A move by class (no geid) is split with <see cref="ClassMoveSplit"/> among the named geids of its class that may be
+/// at its source or on a carrier, so it needs every geid's current filter at once: one online forward pass runs over all
+/// the evidence in time order and fixes each class move's kernels there. Each chain is then smoothed with those kernels as
 /// they are. This frozen coupling is the approximation of decision B1, constraint 3: what a later step teaches about
 /// one geid does not revise how an earlier class move was shared with the others.
 /// </para>
 /// <para>
-/// Arrival order at the source, most recent first, is approximated by the time of each geid's last step that targeted
-/// that source. The units the named geids do not supply come from the source's lot (<see cref="LotLaw"/>); carriers,
-/// Out of sight and births beyond it are out of scope. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5)
+/// A class move is served in a fixed order of places: the source, then, unless the source is the target, the body, then
+/// the carried containers by key; at each, its geids, latest arrival first, then its lot (<see cref="LotLaw"/>). Arrival
+/// is approximated by the last step that targeted the place. A container is carried, a hard decision, when the most
+/// probable holders, as of each container's last step, lead from it to the body in 6 hops at most without passing
+/// through the source or the target. Geids and lots are taken as independent of one another. Out of sight and births
+/// beyond these places are out of scope. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5)
 /// and resets (B7). Continuous hazards (B6) and the game updates without a reset (B8, <c>updates</c>) apply only when
 /// <c>hazards</c> is given.
 /// </para>
@@ -31,11 +34,12 @@ public static class NamedChains
 
     /// <returns>
     /// Lots: the mean, at the end, of the law of the units per (holder, class) that no geid names. A successful Buy
-    /// shifts that law by its Amount; a class move takes T = min(K, L) from the source lot L, K being its shortfall, and
-    /// adds T to the target lot; a geid first seen on a named move out of a lot is that lot's unit with P(L ≥ 1), and the
-    /// lot becomes max(0, L − 1). This is an approximation: K and L, and the target lot and T, are taken as independent,
-    /// though one class move shares its units between the geids and the lots. Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
-    /// included. MeanShortfall: the expected number of units per class move that no named geid supplied.
+    /// shifts that law by its Amount; a class move takes T = min(K, L) from each lot L of its places, K being the units the
+    /// places before it leave wanted, and adds T to the target lot; a geid first seen on a named move out of a lot is that lot's unit with P(L ≥ 1), and the
+    /// lot becomes max(0, L − 1). This is an approximation: K and L, and the target lot and each T, are taken as independent,
+    /// though one class move shares its units between the geids and the lots; adding several T keeps the target lot's mean
+    /// exact, not its law. Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
+    /// included. MeanShortfall: the expected number of units per class move that no named geid of its source supplied.
     /// </returns>
     public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall, IReadOnlyDictionary<(Holder, string), double> Lots) Run(
         IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta, Hazards? hazards = null,
@@ -123,34 +127,56 @@ public static class NamedChains
             events.Add((body.Ts, 1, body.Provenance, seq =>
             {
                 foreach (var geid in law.Keys.Where(g => !listed.Contains(g) && At(holders[g], Holder.Body) is { } b && law[g][b] > 0).ToList())
-                    Apply(geid, seq, body.Provenance, body.Ts, null, null, h => Shift(h, Holder.Body, Holder.OutOfSight, 1 - delta));
+                    Apply(geid, seq, body.Provenance, body.Ts, null, null, h => Shift(h, [(Holder.Body, 1 - delta)], Holder.OutOfSight));
             }));
         }
 
-        // A move by class: no geid, succeeded or no answer, n > 0 units from a real source. Candidate o moves with
-        // r_o = Moved_o / p_o, where p_o = P(X_o = s) on its current filter; no source likelihood, since it is not named.
+        double Mass(string geid, Holder holder) => At(holders[geid], holder) is { } i ? law[geid][i] : 0;
+
+        bool Carried(Holder holder, Holder s, Holder t)
+        {
+            for (var hops = 0; hops <= 6; hops++)   // a cycle of containers ends here too
+            {
+                if (holder == Holder.Body) return true;
+                if (holder == s || holder == t || holder.Kind != "Container" || !law.TryGetValue(holder.Key, out var p)) return false;
+                holder = holders[holder.Key][Array.IndexOf(p, p.Max())];
+            }
+            return false;
+        }
+
+        // A move by class: no geid, succeeded or no answer, n > 0 units from a real source. A candidate leaves each of its
+        // places with that place's r, all in one kernel; no source likelihood, since it is not named.
         foreach (var m in moveList.Where(m => m.Geid is null && m.Result is null or "succeed" && m.Amount > 0
                      && !NotClassMoves.Contains(m.MoveType) && !m.MoveType.StartsWith("Query", StringComparison.Ordinal)))
         {
             if (SourceOf(m) is not { } s || TargetOf(m) is not { } t) continue;
             events.Add((m.Ts, 0, m.Provenance, seq =>
             {
-                var candidates = byClass[m.ItemClass].Where(g => At(holders[g], s) is { } i && law[g][i] > 0)
-                    .OrderByDescending(g => arrived.GetValueOrDefault((g, s), -1)).ToList();
-                foreach (var g in candidates) Decay(g, m.Ts);   // p_o is read after D
-                var presence = candidates.Select(g => law[g][holders[g].IndexOf(s)]).ToArray();
-                var (moved, shortfall) = ClassMoveSplit.Split(presence, (int)m.Amount);
-                shortfalls.Add(Mean(shortfall));
+                // Only the holders known for the class can supply it. The body's empty key sorts it before the containers.
+                var carriers = byClass[m.ItemClass].SelectMany(g => holders[g])
+                    .Concat(lots.Keys.Where(k => k.Item2 == m.ItemClass).Select(k => k.Item1)).Distinct()
+                    .Where(h => s != t && h != s && h != t && Carried(h, s, t)).OrderBy(h => h.Key, StringComparer.Ordinal);
+                var from = carriers.Prepend(s).ToList();
+                var places = from.SelectMany(h => byClass[m.ItemClass].Where(g => Mass(g, h) > 0)
+                    .OrderByDescending(g => arrived.GetValueOrDefault((g, h), -1)).ThenBy(g => g, StringComparer.Ordinal)
+                    .Select(g => (At: h, Geid: (string?)g)).Append((At: h, Geid: null))).ToList();
+                var candidates = places.Where(p => p.Geid is not null).Select(p => (p.At, Geid: p.Geid!)).ToList();
+                foreach (var (_, g) in candidates) Decay(g, m.Ts);   // the masses are read after D
+                var supply = ClassMoveSplit.Supply([.. places.Select(p => (p.Geid,
+                    p.Geid is { } g ? [1 - Mass(g, p.At), Mass(g, p.At)] : Lot(p.At, m.ItemClass)))], (int)m.Amount);
+                var presence = candidates.Where(p => p.At == s).Select(p => Mass(p.Geid, s)).ToList();
+                shortfalls.Add(Mean(ClassMoveSplit.Split(presence, (int)m.Amount).Shortfall));
                 if (s != t)   // L − T and T are not independent: adding T back would spread the lot's law
+                    foreach (var (h, (taken, left)) in from.Zip(supply.Lots))
+                    {
+                        lots[(h, m.ItemClass)] = left;
+                        lots[(t, m.ItemClass)] = LotLaw.Add(Lot(t, m.ItemClass), taken);
+                    }
+                foreach (var rows in candidates.Zip(supply.R, (p, r) => (p.Geid, p.At, R: r)).GroupBy(x => x.Geid))
                 {
-                    var (taken, left) = LotLaw.Take(shortfall, Lot(s, m.ItemClass));
-                    lots[(s, m.ItemClass)] = left;
-                    lots[(t, m.ItemClass)] = LotLaw.Add(Lot(t, m.ItemClass), taken);
-                }
-                for (var i = 0; i < candidates.Count; i++)
-                {
-                    var r = Math.Min(1, moved[i] / presence[i]);   // presence > 0: candidates hold s with some mass
-                    Apply(candidates[i], seq, m.Provenance, m.Ts, null, t, h => Shift(h, s, t, r));
+                    // A crumb from a carrier is no arrival where the geid already has more mass; nor is an empty move.
+                    var arrives = Mass(rows.Key, s) > 0 || rows.Sum(x => x.R * Mass(x.Geid, x.At)) > Mass(rows.Key, t);
+                    Apply(rows.Key, seq, m.Provenance, m.Ts, null, arrives ? t : null, h => Shift(h, rows.Select(x => (x.At, x.R)), t));
                 }
             }));
         }
@@ -206,14 +232,19 @@ public static class NamedChains
         return new ChainStep(m, null);
     }
 
-    // On row `from`, stay with 1 − r or go to `to` with r. Every other state stays where it is.
-    private static ChainStep Shift(List<Holder> holders, Holder from, Holder to, double r)
+    // On each row `From`, stay with 1 − r or go to `to` with r. Every other state stays where it is; so does every state
+    // when the geid does not know `to`, since nothing arrives there.
+    private static ChainStep Shift(List<Holder> holders, IEnumerable<(Holder From, double R)> rows, Holder to)
     {
         var m = new double[holders.Count, holders.Count];
         for (var i = 0; i < holders.Count; i++) m[i, i] = 1;
-        int f = holders.IndexOf(from), t = holders.IndexOf(to);
-        m[f, f] -= r;
-        m[f, t] += r;
+        if (At(holders, to) is { } t)
+            foreach (var (from, r) in rows)
+            {
+                var f = holders.IndexOf(from);
+                m[f, f] -= r;
+                m[f, t] += r;
+            }
         return new ChainStep(m, null);
     }
 }
