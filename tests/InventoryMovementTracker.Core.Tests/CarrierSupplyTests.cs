@@ -25,8 +25,8 @@ public sealed class CarrierSupplyTests
         new(new Provenance(1, ++_line, 0), At(hours), geid, "cls", "Backpack", _line, parent, false);
 
     private static IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Run(
-        MoveEvidence[] moves, SightingEvidence[] sightings, double epsilon = Eps, Hazards? hazards = null) =>
-        NamedChains.Run(moves, sightings, epsilon, delta: Eps, hazards).Chains;
+        MoveEvidence[] moves, SightingEvidence[] sightings, double epsilon = Eps, Hazards? hazards = null, double birth = 0) =>
+        NamedChains.Run(moves, sightings, epsilon, delta: Eps, hazards, birth: birth).Chains;
 
     private static (string?, double[]) Geid(string geid, double p) => (geid, [1 - p, p]);
 
@@ -100,7 +100,7 @@ public sealed class CarrierSupplyTests
     {
         var chain = Run([ClassMove(1, S, T), Take(2, "g", T, Holder.Body)], [Seen(0, "g")])["g"];
 
-        Assert.Equal(.99, chain[^1].SourceProbability!.Value, Tolerance);
+        Assert.Equal(1, chain[^1].SourceProbability!.Value, Tolerance);
     }
 
     [Fact]
@@ -127,7 +127,7 @@ public sealed class CarrierSupplyTests
         // a: Body 0.99, then stored in T, where it keeps a crumb on the body. b: Body 0.99, all of which goes to T.
         var chains = Run([Store(1, "a", T), ClassMove(3, S, T), ClassMove(4, T, C)], [Seen(0, "a"), Seen(2, "b")]);
 
-        Assert.Equal(.99, chains["b"][^1].Smoothed[C], Tolerance);
+        Assert.Equal(.9999, chains["b"][^1].Smoothed[C], Tolerance);
     }
 
     [Fact]
@@ -150,18 +150,19 @@ public sealed class CarrierSupplyTests
     public void Case_12_the_kernel_applies_without_an_arrival()
     {
         // ε = 0.5. g: seen on the body (Body 0.5), then in T (T 0.5, Body 0.25, Out of sight 0.25). h: stored in T after it
-        // (T 0.5). The move S→T takes g's body mass with r = 1: T = 0.75; 0.25 < 0.5, so h stays T's latest arrival.
-        // The move T→C takes h with r = 1, then g with r = 1 − 0.5: 0.75 · 0.5 = 0.375 (0.75 if g had been refreshed).
+        // (T 0.5). The move S→T takes g's body and Out of sight masses with r = 1: T = 1, and h's Out of sight mass with
+        // r = 0.5: T = 0.75. g's arrival, 0.5 at most, does not exceed the 0.5 it has in T, so h stays T's latest arrival.
+        // The move T→C takes h with r = 1, then g with r = 1 − 0.75 (1 if g had been refreshed).
         var chains = Run([Store(2, "h", T), ClassMove(3, S, T), ClassMove(4, T, C)], [Seen(0, "g"), Seen(1, "g", T.Key)], epsilon: .5);
 
-        Assert.Equal(.75, chains["g"][^1].Predictive[T], Tolerance);
-        Assert.Equal(.375, chains["g"][^1].Smoothed[C], Tolerance);
-        Assert.Equal(.5, chains["h"][^1].Smoothed[C], Tolerance);
+        Assert.Equal(1, chains["g"][^1].Predictive[T], Tolerance);
+        Assert.Equal(.25, chains["g"][^1].Smoothed[C], Tolerance);
+        Assert.Equal(.75, chains["h"][^1].Smoothed[C], Tolerance);
     }
 
     [Theory]
-    [InlineData("S", .99)]   // B, worn through P, serves the empty S
-    [InlineData("P", 0)]     // B is inside the source itself
+    [InlineData("S", 1)]     // B, worn through P, serves the empty S
+    [InlineData("P", .01)]   // B is inside the source itself: only Out of sight serves
     public void Case_13_a_carried_container_serves_unless_it_is_inside_the_source(string source, double expected)
     {
         // P and B are of another class, so that only g can answer the class move.
@@ -170,6 +171,6 @@ public sealed class CarrierSupplyTests
             hazards: new Hazards(0, 0, 0, 1))["g"];
 
         Assert.Equal(expected, chain[^1].SourceProbability!.Value, Tolerance);
-        Assert.Equal(.99 - expected, chain[^1].Predictive[new("Container", "B")], Tolerance);
+        Assert.Equal(1 - expected, chain[^1].Predictive[new("Container", "B")], Tolerance);
     }
 }

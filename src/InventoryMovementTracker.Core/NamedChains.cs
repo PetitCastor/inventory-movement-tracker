@@ -8,8 +8,8 @@ namespace InventoryMovementTracker.Core;
 /// of the class moves it may have followed.
 /// <para>
 /// A move by class (no geid) is split with <see cref="ClassMoveSplit"/> among the named geids of its class that may be
-/// at its source or on a carrier, so it needs every geid's current filter at once: one online forward pass runs over all
-/// the evidence in time order and fixes each class move's kernels there. Each chain is then smoothed with those kernels as
+/// at its source, on a carrier or Out of sight, so it needs every geid's current filter at once: one online forward pass
+/// runs over all the evidence in time order and fixes each class move's kernels there. Each chain is then smoothed with those kernels as
 /// they are. This frozen coupling is the approximation of decision B1, constraint 3: what a later step teaches about
 /// one geid does not revise how an earlier class move was shared with the others.
 /// </para>
@@ -18,14 +18,22 @@ namespace InventoryMovementTracker.Core;
 /// the carried containers by key; at each, its geids, latest arrival first, then its lot (<see cref="LotLaw"/>). Arrival
 /// is approximated by the last step that targeted the place. A container is carried, a hard decision, when the most
 /// probable holders, as of each container's last step, lead from it to the body in 6 hops at most without passing
-/// through the source or the target. Geids and lots are taken as independent of one another. Out of sight and births
-/// beyond these places are out of scope. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5)
-/// and resets (B7). Continuous hazards (B6) and the game updates without a reset (B8, <c>updates</c>) apply only when
-/// <c>hazards</c> is given.
+/// through the source or the target. Geids and lots are taken as independent of one another. Each unit the source lacks
+/// is born in the target's lot with probability <c>birth</c>; the others are asked of the carriers, then of the geids seen
+/// before that are Out of sight, in ordinal order since nothing there has a recency, and born if these lack them too. A
+/// birth is drawn before the carriers serve, so the share of births exceeds <c>birth</c>. A move without a real source is
+/// all births. Out of scope: the lost-queue rule of §4 and MoveAll (B9) and resets (B7). Continuous hazards (B6) and the
+/// game updates without a reset (B8, <c>updates</c>) apply only when <c>hazards</c> is given.
 /// </para>
 /// </summary>
 public static class NamedChains
 {
+    /// <summary>
+    /// π_naiss (P0.1 §7), learned on the frozen corpus: its complete listings before 2026-10-01, both outcomes, listed and
+    /// absent, rather than the 42 first appearances out of 57 units. Flat between 0.95 and 0.99.
+    /// </summary>
+    public const double DefaultBirth = 0.97;
+
     private static readonly HashSet<string> NamedMoves = ["Store", "Interaction", "StoreItem", "Drop", "Death"];
     private static readonly HashSet<string> NotClassMoves = ["Split", "Stack", "StackAll", "Sort", "AmmoRepool", "Buy", "MoveAll"];
     private static readonly string[] Consumables = ["Drink_", "Food_", "crlf_consumable_"];
@@ -35,15 +43,16 @@ public static class NamedChains
     /// <returns>
     /// Lots: the mean, at the end, of the law of the units per (holder, class) that no geid names. A successful Buy
     /// shifts that law by its Amount; a class move takes T = min(K, L) from each lot L of its places, K being the units the
-    /// places before it leave wanted, and adds T to the target lot; a geid first seen on a named move out of a lot is that lot's unit with P(L ≥ 1), and the
+    /// places before it leave wanted, and adds T and its births to the target lot; a geid first seen on a named move out of a lot is that lot's unit with P(L ≥ 1), and the
     /// lot becomes max(0, L − 1). This is an approximation: K and L, and the target lot and each T, are taken as independent,
-    /// though one class move shares its units between the geids and the lots; adding several T keeps the target lot's mean
-    /// exact, not its law. Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
+    /// though one class move shares its units between the geids and the lots; adding several T and the births, as if independent, keeps
+    /// the target lot's mean exact, not its law (n = 3 and a source lot of 0 or 1 unit, 0.5 each: the gain is 3, the sum gives
+    /// 2, 3 and 4 with 0.25, 0.5 and 0.25). Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
     /// included. MeanShortfall: the expected number of units per class move that no named geid of its source supplied.
     /// </returns>
     public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall, IReadOnlyDictionary<(Holder, string), double> Lots) Run(
         IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta, Hazards? hazards = null,
-        IReadOnlyList<DateTimeOffset>? updates = null)
+        IReadOnlyList<DateTimeOffset>? updates = null, double birth = DefaultBirth)
     {
         // A named move that succeeded or got no answer weighs its source, then jumps to its target; a Drop's target is
         // the floor under its key as stored. failed: nothing. lost: the source only, no jump; the §4 queue rule waits.
@@ -93,10 +102,15 @@ public static class NamedChains
             law[geid] = ObjectChain.Filter(law[geid], pending[geid](holders[geid]), $"at {ts}");
         }
 
+        void Know(string geid, Holder holder)
+        {
+            if (!holders[geid].Contains(holder)) { holders[geid].Add(holder); law[geid] = [.. law[geid], 0]; }
+        }
+
         void Apply(string geid, int seq, Provenance p, string ts, Holder? source, Holder? target, Func<List<Holder>, ChainStep> kernel)
         {
             Decay(geid, ts);
-            if (target is not null && !holders[geid].Contains(target)) { holders[geid].Add(target); law[geid] = [.. law[geid], 0]; }
+            if (target is not null) Know(geid, target);
             law[geid] = ObjectChain.Filter(law[geid], kernel(holders[geid]), $"at {ts}");
             steps[geid].Add((p, ts, source, kernel, pending.Remove(geid, out var decay) ? decay : null));
             if (target is not null) arrived[(geid, target)] = seq;
@@ -144,38 +158,45 @@ public static class NamedChains
             return false;
         }
 
-        // A move by class: no geid, succeeded or no answer, n > 0 units from a real source. A candidate leaves each of its
+        // A move by class: no geid, succeeded or no answer, n > 0 units to a real target. A candidate leaves each of its
         // places with that place's r, all in one kernel; no source likelihood, since it is not named.
         foreach (var m in moveList.Where(m => m.Geid is null && m.Result is null or "succeed" && m.Amount > 0
                      && !NotClassMoves.Contains(m.MoveType) && !m.MoveType.StartsWith("Query", StringComparison.Ordinal)))
         {
-            if (SourceOf(m) is not { } s || TargetOf(m) is not { } t) continue;
+            if (TargetOf(m) is not { } t) continue;
+            var s = SourceOf(m);   // none real: no place, so every unit is born
             events.Add((m.Ts, 0, m.Provenance, seq =>
             {
                 // Only the holders known for the class can supply it. The body's empty key sorts it before the containers.
                 var carriers = byClass[m.ItemClass].SelectMany(g => holders[g])
                     .Concat(lots.Keys.Where(k => k.Item2 == m.ItemClass).Select(k => k.Item1)).Distinct()
-                    .Where(h => s != t && h != s && h != t && Carried(h, s, t)).OrderBy(h => h.Key, StringComparer.Ordinal);
-                var from = carriers.Prepend(s).ToList();
-                var places = from.SelectMany(h => byClass[m.ItemClass].Where(g => Mass(g, h) > 0)
+                    .Where(h => h != s && h != t && Carried(h, s!, t)).OrderBy(h => h.Key, StringComparer.Ordinal);
+                List<Holder> from = s is null ? [] : s == t ? [s] : [s, .. carriers, Holder.OutOfSight];
+                var places = from.SelectMany(h => byClass[m.ItemClass].Where(g => steps[g].Any() && Mass(g, h) > 0)
                     .OrderByDescending(g => arrived.GetValueOrDefault((g, h), -1)).ThenBy(g => g, StringComparer.Ordinal)
-                    .Select(g => (At: h, Geid: (string?)g)).Append((At: h, Geid: null))).ToList();
+                    .Select(g => (At: h, Geid: (string?)g)).Concat(h == Holder.OutOfSight ? [] : [(At: h, Geid: null)])).ToList();
                 var candidates = places.Where(p => p.Geid is not null).Select(p => (p.At, Geid: p.Geid!)).ToList();
                 foreach (var (_, g) in candidates) Decay(g, m.Ts);   // the masses are read after D
                 var supply = ClassMoveSplit.Supply([.. places.Select(p => (p.Geid,
-                    p.Geid is { } g ? [1 - Mass(g, p.At), Mass(g, p.At)] : Lot(p.At, m.ItemClass)))], (int)m.Amount);
-                var presence = candidates.Where(p => p.At == s).Select(p => Mass(p.Geid, s)).ToList();
-                shortfalls.Add(Mean(ClassMoveSplit.Split(presence, (int)m.Amount).Shortfall));
+                    p.Geid is { } g ? [1 - Mass(g, p.At), Mass(g, p.At)] : Lot(p.At, m.ItemClass)))], (int)m.Amount, places.Count(p => p.At == s), birth);
+                var presence = candidates.Where(p => p.At == s).Select(p => Mass(p.Geid, p.At)).ToList();
+                if (s is not null) shortfalls.Add(Mean(ClassMoveSplit.Split(presence, (int)m.Amount).Shortfall));
                 if (s != t)   // L − T and T are not independent: adding T back would spread the lot's law
-                    foreach (var (h, (taken, left)) in from.Zip(supply.Lots))
+                {
+                    foreach (var (h, (taken, left)) in from.Zip(supply.Lots))   // Out of sight, last, has no lot
                     {
                         lots[(h, m.ItemClass)] = left;
                         lots[(t, m.ItemClass)] = LotLaw.Add(Lot(t, m.ItemClass), taken);
                     }
+                    lots[(t, m.ItemClass)] = LotLaw.Add(Lot(t, m.ItemClass), supply.Short);
+                }
                 foreach (var rows in candidates.Zip(supply.R, (p, r) => (p.Geid, p.At, R: r)).GroupBy(x => x.Geid))
                 {
-                    // A crumb from a carrier is no arrival where the geid already has more mass; nor is an empty move.
-                    var arrives = Mass(rows.Key, s) > 0 || rows.Sum(x => x.R * Mass(x.Geid, x.At)) > Mass(rows.Key, t);
+                    // A crumb from a carrier is no arrival where the geid already has more mass; nor is an empty move, nor what
+                    // comes from Out of sight, where every geid leaves a crumb: the kernel moves it, without a recency.
+                    var arrives = Mass(rows.Key, s!) > 0
+                        || rows.Where(x => x.At != Holder.OutOfSight).Sum(x => x.R * Mass(x.Geid, x.At)) > Mass(rows.Key, t);
+                    if (rows.Any(x => x.R * Mass(x.Geid, x.At) > 0)) Know(rows.Key, t);
                     Apply(rows.Key, seq, m.Provenance, m.Ts, null, arrives ? t : null, h => Shift(h, rows.Select(x => (x.At, x.R)), t));
                 }
             }));
