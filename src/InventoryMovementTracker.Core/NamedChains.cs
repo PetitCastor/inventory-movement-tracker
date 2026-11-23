@@ -15,8 +15,8 @@ namespace InventoryMovementTracker.Core;
 /// </para>
 /// <para>
 /// Arrival order at the source, most recent first, is approximated by the time of each geid's last step that targeted
-/// that source. The units the named geids do not supply (lots, carriers, Out of sight, births) are out of scope (B5);
-/// only their expected count is returned. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5)
+/// that source. The units the named geids do not supply come from the source's lot (<see cref="LotLaw"/>); carriers,
+/// Out of sight and births beyond it are out of scope. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5)
 /// and resets (B7). Continuous hazards (B6) and the game updates without a reset (B8, <c>updates</c>) apply only when
 /// <c>hazards</c> is given.
 /// </para>
@@ -30,10 +30,11 @@ public static class NamedChains
     private static readonly HashSet<string> Targets = ["Container", "Location", "Equipped", "Corpse", "World"];
 
     /// <returns>
-    /// Lots: the expected units per (holder, class) that no geid names, at the end. A lot is a mean-field count (an
-    /// expected number, not a law): a successful Buy adds its Amount; a class move takes its expected shortfall from the
-    /// source lot, at most what it holds, into the target lot; a geid first seen on a named move out of a lot of
-    /// size L is that lot's unit with probability min(1, L), which then loses it. Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
+    /// Lots: the mean, at the end, of the law of the units per (holder, class) that no geid names. A successful Buy
+    /// shifts that law by its Amount; a class move takes T = min(K, L) from the source lot L, K being its shortfall, and
+    /// adds T to the target lot; a geid first seen on a named move out of a lot is that lot's unit with P(L ≥ 1), and the
+    /// lot becomes max(0, L − 1). This is an approximation: K and L, and the target lot and T, are taken as independent,
+    /// though one class move shares its units between the geids and the lots. Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
     /// included. MeanShortfall: the expected number of units per class move that no named geid supplied.
     /// </returns>
     public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall, IReadOnlyDictionary<(Holder, string), double> Lots) Run(
@@ -63,7 +64,8 @@ public static class NamedChains
         var pending = new Dictionary<string, Func<List<Holder>, ChainStep>>();
         var arrived = new Dictionary<(string, Holder), int>();
         var shortfalls = new List<double>();
-        var lots = new Dictionary<(Holder, string), double>();
+        var lots = new Dictionary<(Holder, string), double[]>();
+        double[] Lot(Holder holder, string cls) => lots.GetValueOrDefault((holder, cls), [1]);   // no lot: 0 units
         var births = new Dictionary<string, (Holder Source, double Q)>();
         double[] Prior(string geid, int k)
         {
@@ -98,11 +100,10 @@ public static class NamedChains
 
         var events = named.Select(e => (e.Ts, e.Phase, e.Provenance, Run: (Action<int>)(seq =>
         {
-            if (!steps[e.Geid].Any() && e.Source is { } s0 && lots.GetValueOrDefault((s0, e.Class)) is var lot and > 0)
+            if (!steps[e.Geid].Any() && e.Source is { } s0 && 1 - Lot(s0, e.Class)[0] is var q and > 0)
             {
-                var q = Math.Min(1, lot);
                 births[e.Geid] = (s0, q);
-                lots[(s0, e.Class)] = lot - q;
+                lots[(s0, e.Class)] = LotLaw.Take([0, 1], Lot(s0, e.Class)).Left;
                 law[e.Geid] = Prior(e.Geid, law[e.Geid].Length);
             }
             Apply(e.Geid, seq, e.Provenance, e.Ts, e.Source, e.Target, h => ChainStep.Move(h.Count, At(h, e.Source), At(h, e.Target), epsilon));
@@ -111,7 +112,7 @@ public static class NamedChains
         // A successful Buy: its Amount is born in the target, which already is the landing station.
         foreach (var m in moveList.Where(m => m.MoveType == "Buy" && m.Result == "succeed" && m.Amount > 0))
             if (TargetOf(m) is { } at)
-                events.Add((m.Ts, 0, m.Provenance, _ => lots[(at, m.ItemClass)] = lots.GetValueOrDefault((at, m.ItemClass)) + m.Amount));
+                events.Add((m.Ts, 0, m.Provenance, _ => lots[(at, m.ItemClass)] = LotLaw.Add(Lot(at, m.ItemClass), [.. new double[m.Amount], 1])));
 
         // A burst with the Body_ItemPort line is a complete listing: a geid that may be on the body and that the listing
         // leaves out goes from the body to Out of sight with 1 − δ.
@@ -139,11 +140,13 @@ public static class NamedChains
                 foreach (var g in candidates) Decay(g, m.Ts);   // p_o is read after D
                 var presence = candidates.Select(g => law[g][holders[g].IndexOf(s)]).ToArray();
                 var (moved, shortfall) = ClassMoveSplit.Split(presence, (int)m.Amount);
-                var missing = shortfall.Select((p, k) => p * k).Sum();
-                shortfalls.Add(missing);
-                var take = Math.Min(missing, lots.GetValueOrDefault((s, m.ItemClass)));
-                lots[(s, m.ItemClass)] = lots.GetValueOrDefault((s, m.ItemClass)) - take;
-                lots[(t, m.ItemClass)] = lots.GetValueOrDefault((t, m.ItemClass)) + take;
+                shortfalls.Add(Mean(shortfall));
+                if (s != t)   // L − T and T are not independent: adding T back would spread the lot's law
+                {
+                    var (taken, left) = LotLaw.Take(shortfall, Lot(s, m.ItemClass));
+                    lots[(s, m.ItemClass)] = left;
+                    lots[(t, m.ItemClass)] = LotLaw.Add(Lot(t, m.ItemClass), taken);
+                }
                 for (var i = 0; i < candidates.Count; i++)
                 {
                     var r = Math.Min(1, moved[i] / presence[i]);   // presence > 0: candidates hold s with some mass
@@ -168,8 +171,10 @@ public static class NamedChains
                 t > 0 && e.Source?.Kind is "Container" or "Location" ? predictive[t * stride + stride - 1][h.IndexOf(e.Source!)] : null,
                 Law(predictive[t * stride + stride - 1]), Law(smoothed[t * stride + stride - 1])))];
         }
-        return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average(), lots);
+        return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average(), lots.ToDictionary(kv => kv.Key, kv => Mean(kv.Value)));
     }
+
+    private static double Mean(double[] law) => law.Select((p, k) => p * k).Sum();
 
     // §4: a Store never names its source, which is always the player's hand or body.
     private static Holder? SourceOf(MoveEvidence m) =>
