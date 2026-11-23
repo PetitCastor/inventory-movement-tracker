@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Globalization;
 
 namespace InventoryMovementTracker.Core;
@@ -74,21 +75,39 @@ public static class NamedChains
         // the floor under its key as stored. failed: nothing. lost: the source only, no jump, unless its queue may have filled it.
         // A seen line, placeholders aside, is named evidence: a jump to the body, or to its parent container.
         var moveList = moves.ToList();
-        var (queues, unweighed) = LostQueues(moveList);
+        var (queues, unweighed, queueOf) = LostQueues(moveList);
+        var queued = queues.SelectMany(q => q.Lines).Select(m => m.Provenance).ToHashSet();
         var seen = sightings.Where(s => !s.Placeholder).ToList();
+
+        // E5: the lines that carry each geid's law (no holder) and each lot's, as ranks in `lines`.
+        var lines = moveList.Select(m => m.Provenance).Concat(seen.Select(s => s.Provenance)).Distinct()
+            .OrderBy(p => p.SessionId).ThenBy(p => p.LineOffset).ThenBy(p => p.ItemIx).ToList();
+        var rank = lines.Index().ToDictionary(x => x.Item, x => x.Index);
+        var evidence = new Dictionary<(Holder?, string), BitArray>();
+        BitArray E(Holder? at, string name) => evidence.TryGetValue((at, name), out var e) ? e : evidence[(at, name)] = Lines();
+        BitArray Lines(params IEnumerable<Provenance> of)
+        {
+            var bits = new BitArray(lines.Count);
+            foreach (var p in of) bits[rank[p]] = true;
+            return bits;
+        }
+        // A queue's lines, with what the geids they name had: replayed without it, a line would be one's first proof, a birth.
+        BitArray OfQueue(List<MoveEvidence> queue) =>
+            queue.Where(m => m.Geid is not null).Aggregate(Lines(queue.Select(m => m.Provenance)), (bits, m) => bits.Or(E(null, m.Geid!)));
+
         var named = moveList
             .Where(m => m.Geid is not null && NamedMoves.Contains(m.MoveType) && m.Result != "failed")
             .Select(m => (Geid: m.Geid!, Class: m.ItemClass, m.Ts, Phase: 0, m.Provenance, Source: unweighed.Contains(m) ? null : SourceOf(m),
-                Target: m.Result != "lost" ? TargetOf(m) : null))
+                Target: m.Result != "lost" ? TargetOf(m) : null, Queue: queueOf.GetValueOrDefault(m, [])))
             .Concat(seen.Select(s => (s.Geid, Class: s.ClassName, s.Ts, Phase: 1, s.Provenance, Source: (Holder?)null,
-                Target: (Holder?)(s.ParentGeid is { } parent ? new Holder("Container", parent) : Holder.Body))))
+                Target: (Holder?)(s.ParentGeid is { } parent ? new Holder("Container", parent) : Holder.Body), Queue: new List<MoveEvidence>())))
             .ToList();
 
         var holders = named.GroupBy(e => e.Geid).ToDictionary(g => g.Key, g => g
             .SelectMany(e => new[] { e.Source, e.Target }).OfType<Holder>().Prepend(Holder.OutOfSight).Distinct().ToList());
         var byClass = named.GroupBy(e => e.Geid).ToLookup(g => g.First().Class, g => g.Key);
         var law = holders.ToDictionary(kv => kv.Key, kv => (double[])[1, .. new double[kv.Value.Count - 1]]);
-        var steps = holders.ToDictionary(kv => kv.Key, _ => new List<(Provenance P, string Ts, Holder? Source, Func<List<Holder>, ChainStep> Kernel, Func<List<Holder>, ChainStep>? Decay)>());
+        var steps = holders.ToDictionary(kv => kv.Key, _ => new List<(Provenance P, string Ts, Holder? Source, Func<List<Holder>, ChainStep> Kernel, Func<List<Holder>, ChainStep>? Decay, BitArray Evidence)>());
         var classOf = named.GroupBy(e => e.Geid).ToDictionary(g => g.Key, g => g.First().Class);
         var lastTs = new Dictionary<string, DateTimeOffset>();
         var pending = new Dictionary<string, Func<List<Holder>, ChainStep>>();
@@ -124,24 +143,30 @@ public static class NamedChains
             if (!holders[geid].Contains(holder)) { holders[geid].Add(holder); law[geid] = [.. law[geid], 0]; }
         }
 
-        void Apply(string geid, int seq, Provenance p, string ts, Holder? source, Holder? target, Func<List<Holder>, ChainStep> kernel)
+        void Apply(string geid, int seq, Provenance p, string ts, Holder? source, Holder? target, Func<List<Holder>, ChainStep> kernel, BitArray read)
         {
             Decay(geid, ts);
             if (target is not null) Know(geid, target);
             law[geid] = ObjectChain.Filter(law[geid], kernel(holders[geid]), $"at {ts}");
-            steps[geid].Add((p, ts, source, kernel, pending.Remove(geid, out var decay) ? decay : null));
+            E(null, geid).Or(read);
+            steps[geid].Add((p, ts, source, kernel, pending.Remove(geid, out var decay) ? decay : null, new BitArray(E(null, geid))));
             if (target is not null) arrived[(geid, target)] = seq;
         }
 
         var events = named.Select(e => (e.Ts, e.Phase, e.Provenance, Run: (Action<int>)(seq =>
         {
+            if (!steps[e.Geid].Any() && e.Source is { } at) E(null, e.Geid).Or(E(at, e.Class));   // an empty lot is read too
             if (!steps[e.Geid].Any() && e.Source is { } s0 && 1 - Lot(s0, e.Class)[0] is var q and > 0)
             {
                 births[e.Geid] = (s0, q);
+                E(s0, e.Class)[rank[e.Provenance]] = true;
                 lots[(s0, e.Class)] = LotLaw.Take([0, 1], Lot(s0, e.Class)).Left;
                 law[e.Geid] = Prior(e.Geid, law[e.Geid].Length);
             }
-            Apply(e.Geid, seq, e.Provenance, e.Ts, e.Source, e.Target, h => ChainStep.Move(h.Count, At(h, e.Source), At(h, e.Target), epsilon));
+            Apply(e.Geid, seq, e.Provenance, e.Ts, e.Source, e.Target, h => ChainStep.Move(h.Count, At(h, e.Source), At(h, e.Target), epsilon),
+                Lines(e.Provenance).Or(OfQueue(e.Queue)));
+            if (queued.Contains(e.Provenance))   // what has received the queue ahead of this line learns what its geid had meanwhile
+                foreach (var of in evidence.Values.Where(of => of[rank[e.Provenance]]).ToList()) of.Or(E(null, e.Geid));
         }))).ToList();
 
         // Before every event of the same key, since a queue bounds the stock at its start.
@@ -151,13 +176,19 @@ public static class NamedChains
             {
                 var presence = byClass[cls].Select(g => Mass(g, at)).ToList();   // a geid without a step is Out of sight: 0
                 lots[(at, cls)] = LotLaw.Max(Lot(at, cls), ClassMoveSplit.Split(presence, k).Shortfall);
+                E(at, cls).Or(OfQueue(q.Lines));
+                foreach (var g in byClass[cls].Where(g => steps[g].Any())) E(at, cls).Or(E(null, g));   // its absence is read too
             }
         }))));
 
         // A successful Buy: its Amount is born in the target, which already is the landing station.
         foreach (var m in moveList.Where(m => m.MoveType == "Buy" && m.Result == "succeed" && m.Amount > 0))
             if (TargetOf(m) is { } at)
-                events.Add((m.Ts, 0, m.Provenance, _ => lots[(at, m.ItemClass)] = LotLaw.Add(Lot(at, m.ItemClass), [.. new double[m.Amount], 1])));
+                events.Add((m.Ts, 0, m.Provenance, _ =>
+                {
+                    lots[(at, m.ItemClass)] = LotLaw.Add(Lot(at, m.ItemClass), [.. new double[m.Amount], 1]);
+                    E(at, m.ItemClass)[rank[m.Provenance]] = true;
+                }));
 
         // A burst with the Body_ItemPort line is a complete listing: a geid that may be on the body and that the listing
         // leaves out goes from the body to Out of sight with 1 − δ.
@@ -168,39 +199,43 @@ public static class NamedChains
             events.Add((body.Ts, 1, body.Provenance, seq =>
             {
                 foreach (var geid in law.Keys.Where(g => !listed.Contains(g) && At(holders[g], Holder.Body) is { } b && law[g][b] > 0).ToList())
-                    Apply(geid, seq, body.Provenance, body.Ts, null, null, h => Shift(h, [(Holder.Body, 1 - delta)], Holder.OutOfSight));
+                    Apply(geid, seq, body.Provenance, body.Ts, null, null, h => Shift(h, [(Holder.Body, 1 - delta)], Holder.OutOfSight), Lines(body.Provenance));
             }));
         }
 
         double Mass(string geid, Holder holder) => At(holders[geid], holder) is { } i ? law[geid][i] : 0;
 
-        // The holder itself, then the most probable holder of each container.
-        IEnumerable<Holder> Up(Holder holder)
+        // The holder itself, then the most probable holder of each container, whose evidence `read` receives.
+        IEnumerable<Holder> Up(Holder holder, BitArray read)
         {
             for (var hops = 0; hops <= 6; hops++)   // a cycle of containers ends here too
             {
                 yield return holder;
                 if (holder.Kind != "Container" || !law.TryGetValue(holder.Key, out var p)) yield break;
+                read.Or(E(null, holder.Key));
                 holder = holders[holder.Key][Array.IndexOf(p, p.Max())];
             }
         }
 
-        bool Carried(Holder holder, Holder s, Holder t) =>
-            Up(holder).TakeWhile(h => h == Holder.Body || (h != s && h != t)).Contains(Holder.Body);
+        bool Carried(Holder holder, Holder s, Holder t, BitArray read) =>
+            Up(holder, read).TakeWhile(h => h == Holder.Body || (h != s && h != t)).Contains(Holder.Body);
 
         foreach (var m in moveList.Where(m => m.MoveType == "MoveAll" && m.Result is null or "succeed"))
         {
             if (SourceOf(m) is not { } s || TargetOf(m) is not { } t || s == t) continue;
             events.Add((m.Ts, 0, m.Provenance, seq =>
             {
-                var up = Up(t).Where(h => h.Kind == "Container").Select(h => h.Key).ToHashSet();
+                var read = Lines(m.Provenance);
+                var up = Up(t, read).Where(h => h.Kind == "Container").Select(h => h.Key).ToHashSet();
+                foreach (var g in steps.Keys.Where(g => up.Contains(g) && steps[g].Any())) E(null, g).Or(read);
                 foreach (var g in law.Keys.Where(g => !up.Contains(g) && Mass(g, s) > 0).ToList())
-                    Apply(g, seq, m.Provenance, m.Ts, null, t, h => Shift(h, [(s, 1 - epsCap)], t));
+                    Apply(g, seq, m.Provenance, m.Ts, null, t, h => Shift(h, [(s, 1 - epsCap)], t), read);
                 foreach (var (_, cls) in lots.Keys.Where(k => k.Item1 == s).ToList())
                 {
                     var lot = Lot(s, cls);
                     lots[(s, cls)] = LotLaw.Thin(lot, epsCap);
                     lots[(t, cls)] = LotLaw.Add(Lot(t, cls), LotLaw.Thin(lot, 1 - epsCap));
+                    E(t, cls).Or(E(s, cls).Or(read));
                 }
             }));
         }
@@ -213,10 +248,11 @@ public static class NamedChains
             var s = SourceOf(m);   // none real: no place, so every unit is born
             events.Add((m.Ts, 0, m.Provenance, seq =>
             {
+                var read = Lines(m.Provenance);
                 // Only the holders known for the class can supply it. The body's empty key sorts it before the containers.
                 var carriers = byClass[m.ItemClass].SelectMany(g => holders[g])
                     .Concat(lots.Keys.Where(k => k.Item2 == m.ItemClass).Select(k => k.Item1)).Distinct()
-                    .Where(h => h != s && h != t && Carried(h, s!, t)).OrderBy(h => h.Key, StringComparer.Ordinal);
+                    .Where(h => h != s && h != t && Carried(h, s!, t, read)).OrderBy(h => h.Key, StringComparer.Ordinal);
                 List<Holder> from = s is null ? [] : s == t ? [s] : [s, .. carriers, Holder.OutOfSight];
                 var places = from.SelectMany(h => byClass[m.ItemClass].Where(g => steps[g].Any() && Mass(g, h) > 0)
                     .OrderByDescending(g => arrived.GetValueOrDefault((g, h), -1)).ThenBy(g => g, StringComparer.Ordinal)
@@ -236,6 +272,23 @@ public static class NamedChains
                     }
                     lots[(t, m.ItemClass)] = LotLaw.Add(Lot(t, m.ItemClass), supply.Short);
                 }
+                // E5: a place's share depends on the places before it and on who is absent from its holder; t's lot, even if it
+                // receives nothing, on all of them, and so does that a geid with no place at all stays out of the move.
+                var known = byClass[m.ItemClass].Where(g => steps[g].Any()).ToList();
+                if (from.Count > 1)   // a lot in a container spared since it is not carried
+                    foreach (var (h, cls) in lots.Keys.Where(k => k.Item1.Kind == "Container" && k.Item2 == m.ItemClass)) E(h, cls).Or(read);
+                foreach (var h in from)
+                {
+                    foreach (var g in known.Except(candidates.Where(c => c.At == h).Select(c => c.Geid))) read.Or(E(null, g));
+                    foreach (var (_, g) in places.Where(p => p.At == h))
+                    {
+                        var own = g is null ? E(h, m.ItemClass) : E(null, g);
+                        own.Or(read);   // even a lot that gives nothing: the places before it spare it
+                        read.Or(own);
+                    }
+                }
+                E(t, m.ItemClass).Or(read);
+                foreach (var g in known.Except(candidates.Select(c => c.Geid))) E(null, g).Or(read);
                 foreach (var rows in candidates.Zip(supply.R, (p, r) => (p.Geid, p.At, R: r)).GroupBy(x => x.Geid))
                 {
                     // A crumb from a carrier is no arrival where the geid already has more mass; nor is an empty move, nor what
@@ -243,7 +296,7 @@ public static class NamedChains
                     var arrives = Mass(rows.Key, s!) > 0
                         || rows.Where(x => x.At != Holder.OutOfSight).Sum(x => x.R * Mass(x.Geid, x.At)) > Mass(rows.Key, t);
                     if (rows.Any(x => x.R * Mass(x.Geid, x.At) > 0)) Know(rows.Key, t);
-                    Apply(rows.Key, seq, m.Provenance, m.Ts, null, arrives ? t : null, h => Shift(h, rows.Select(x => (x.At, x.R)), t));
+                    Apply(rows.Key, seq, m.Provenance, m.Ts, null, arrives ? t : null, h => Shift(h, rows.Select(x => (x.At, x.R)), t), Lines(m.Provenance));
                 }
             }));
         }
@@ -262,7 +315,8 @@ public static class NamedChains
             var stride = hazards is null ? 1 : 2;   // the step's own row is the last of its (D, kernel) pair
             chains[geid] = [.. list.Select((e, t) => new ChainEntry(e.P, e.Ts, e.Source,
                 t > 0 && e.Source?.Kind is "Container" or "Location" ? predictive[t * stride + stride - 1][h.IndexOf(e.Source!)] : null,
-                Law(predictive[t * stride + stride - 1]), Law(smoothed[t * stride + stride - 1])))];
+                Law(predictive[t * stride + stride - 1]), Law(smoothed[t * stride + stride - 1]),
+                lines.Where((p, i) => e.Evidence[i] && p != e.P)))];
         }
         return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average(), lots.ToDictionary(kv => kv.Key, kv => Mean(kv.Value)));
     }
@@ -271,21 +325,27 @@ public static class NamedChains
         && !NotClassMoves.Contains(m.MoveType) && !m.MoveType.StartsWith("Query", StringComparison.Ordinal);
 
     // Per queue, its first lost move and, per (holder, class), the units asked of the holder, those that the queue would
-    // have brought there, and those it proves: the most asked so far less those brought before. Unweighed: the lost moves
-    // from a source that an earlier move of their queue may have filled.
-    private static (List<(MoveEvidence First, Dictionary<(Holder, string), (int Asked, int Brought, int Proved)> Counts)> Queues, HashSet<MoveEvidence> Unweighed)
-        LostQueues(List<MoveEvidence> moves)
+    // have brought there, and those it proves: the most asked so far less those brought before. Lines: the line that
+    // closes the queue before it, its lost moves and the line that closes it. Unweighed: the lost moves from a source that an
+    // earlier move of their queue may have filled. QueueOf: the Lines of each lost move's queue.
+    private static (List<(MoveEvidence First, Dictionary<(Holder, string), (int Asked, int Brought, int Proved)> Counts, List<MoveEvidence> Lines)> Queues,
+        HashSet<MoveEvidence> Unweighed, Dictionary<MoveEvidence, List<MoveEvidence>> QueueOf) LostQueues(List<MoveEvidence> moves)
     {
-        var queues = new List<(MoveEvidence First, Dictionary<(Holder, string), (int Asked, int Brought, int Proved)> Counts)>();
+        var queues = new List<(MoveEvidence First, Dictionary<(Holder, string), (int Asked, int Brought, int Proved)> Counts, List<MoveEvidence> Lines)>();
         var unweighed = new HashSet<MoveEvidence>();
+        var queueOf = new Dictionary<MoveEvidence, List<MoveEvidence>>();
         var open = false;
         foreach (var m in moves.OrderBy(m => m.Ts, StringComparer.Ordinal).ThenBy(m => m.Provenance.SessionId)
                      .ThenBy(m => m.Provenance.LineOffset).ThenBy(m => m.Provenance.ItemIx))
         {
-            open = open && m.Result is not ("succeed" or "failed") && m.Provenance.SessionId == queues[^1].First.Provenance.SessionId;
+            var closes = open && (m.Result is "succeed" or "failed" || m.Provenance.SessionId != queues[^1].First.Provenance.SessionId);
+            if (closes) queues[^1].Lines.Add(m);
+            open = open && !closes;
             if (m.Result != "lost" || m.MoveType == "MoveAll") continue;
-            if (!open) queues.Add((m, []));
+            if (!open) queues.Add((m, [], [.. queues.TakeLast(1).Select(q => q.Lines[^1])]));   // without it, the two would merge
             open = true;
+            queues[^1].Lines.Add(m);
+            queueOf[m] = queues[^1].Lines;
             var (s, t, cls, counts) = (SourceOf(m), TargetOf(m), m.ItemClass, queues[^1].Counts);
             var isNamed = NamedMoves.Contains(m.MoveType) && m.Geid is not null && s is not null;
             if (!isNamed && !(ByClass(m) && t is not null)) continue;
@@ -302,7 +362,7 @@ public static class NamedChains
                 counts[(t, cls)] = at with { Brought = at.Brought + n };
             }
         }
-        return (queues, unweighed);
+        return (queues, unweighed, queueOf);
     }
 
     private static double Mean(double[] law) => law.Select((p, k) => p * k).Sum();
