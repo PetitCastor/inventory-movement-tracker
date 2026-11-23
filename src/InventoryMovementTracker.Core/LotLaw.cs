@@ -18,11 +18,27 @@ public static class LotLaw
     }
 
     /// <returns>The law of the sum of two independent counts: their convolution.</returns>
-    public static double[] Add(double[] a, double[] b)
+    public static double[] Add(double[] a, double[] b) => Combine(a, b, (i, j) => i + j);
+
+    /// <returns>The law of the larger of two independent counts.</returns>
+    public static double[] Max(double[] a, double[] b) => Combine(a, b, Math.Max);
+
+    /// <returns>The law of the units kept when each is kept with probability <paramref name="keep"/>, independently.</returns>
+    public static double[] Thin(double[] law, double keep)
     {
-        var sum = new double[a.Length + b.Length - 1];
+        var kept = new double[law.Length];
+        double[] among = [1];   // the law of the units kept among n
+        for (var n = 0; n < law.Length; n++, among = Add(among, [1 - keep, keep]))
+            for (var k = 0; k <= n; k++) kept[k] += law[n] * among[k];
+        return kept;
+    }
+
+    // The law of a function, increasing in both, of two independent counts.
+    private static double[] Combine(double[] a, double[] b, Func<int, int, int> of)
+    {
+        var law = new double[of(a.Length - 1, b.Length - 1) + 1];
         for (var i = 0; i < a.Length; i++)
-            for (var j = 0; j < b.Length; j++) sum[i + j] += a[i] * b[j];
-        return sum;
+            for (var j = 0; j < b.Length; j++) law[of(i, j)] += a[i] * b[j];
+        return law;
     }
 }
