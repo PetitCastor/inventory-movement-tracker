@@ -61,12 +61,16 @@ public sealed class RhoUpdateTests
     [Fact]
     public void An_update_before_a_geids_first_step_has_no_effect()
     {
-        MoveEvidence[] moves = [Move(5, Hand, S), Move(9, S, Holder.Body, "Interaction")];
-        SessionEvidence[] sessions = [Session(1, 0, 1), Session(2, 2, 2)];
+        // A geid born from a bought lot starts in the station, not Out of sight: only then could ρ' bite before its
+        // first step. The purchase at 1, the update at 3, the geid's first appearance out of the lot at 5.
+        var buy = new MoveEvidence(new Provenance(1, ++_line, 0), At(1), "Buy", "cls", null, 1, "Shop", null, S.Kind, S.Key, "succeed", null, 10);
+        MoveEvidence[] moves = [buy, Move(5, S, Holder.Body, "Interaction")];
+        SessionEvidence[] sessions = [Session(1, 0, 1), Session(2, 3, 2)];
 
-        var plain = Run(moves, sessions)[1].Predictive[S];
+        var plain = Run(moves, sessions)[0].Predictive[S];
 
-        Assert.Equal(plain, Run(moves, sessions, NoRates)[1].Predictive[S], 1e-9);
+        Assert.Equal(1, plain, 1e-9);
+        Assert.Equal(plain, Run(moves, sessions, NoRates)[0].Predictive[S], 1e-9);
     }
 
     [Fact]
