@@ -21,7 +21,7 @@ public sealed class LotLawTests
     private MoveEvidence Take(string geid) => Evidence("Interaction", geid, 1, S.Kind, S.Key, new("Corpse", "dead"));
 
     private static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall, IReadOnlyDictionary<(Holder, string), double> Lots) Run(params MoveEvidence[] moves) =>
-        NamedChains.Run(moves, [], epsilon: Eps, delta: Eps);
+        NamedChains.Run(moves, [], epsilon: Eps, delta: Eps, birth: .4);
 
     // Compares laws, whose arrays may differ by trailing zeros.
     private static void SameLaw(double[] expected, double[] actual)
@@ -60,7 +60,7 @@ public sealed class LotLawTests
         Assert.Equal(.5, chains["a"][1].Predictive[S], Tolerance);
         Assert.Equal(.5, chains["b"][1].Predictive[S], Tolerance);
         Assert.Equal(.25, lots[(S, "cls")], Tolerance);
-        Assert.Equal(1.75, lots[(T, "cls")], Tolerance);
+        Assert.Equal(1.85, lots[(T, "cls")], Tolerance);
     }
 
     [Fact]
