@@ -48,7 +48,7 @@ public sealed class NamedChainsTests
     public void An_uncertain_candidate_moves_with_its_presence()
     {
         // With ε = 0.5 the Store leaves the geid in B with 0.5 and Out of sight with 0.5.
-        var (chains, shortfall) = NamedChains.Run([Move(1, "g", Hand, B), ClassMove(2, B, C, 1)], [], epsilon: 0.5, delta: Eps);
+        var (chains, shortfall, _) = NamedChains.Run([Move(1, "g", Hand, B), ClassMove(2, B, C, 1)], [], epsilon: 0.5, delta: Eps);
 
         Assert.Equal(0.5, chains["g"][^1].Smoothed[C], 1e-12);
         Assert.Equal(0.5, shortfall, 1e-12);   // the unit came from elsewhere half of the time

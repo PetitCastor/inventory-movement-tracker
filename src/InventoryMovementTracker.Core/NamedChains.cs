@@ -26,10 +26,13 @@ public static class NamedChains
     private static readonly HashSet<string> Targets = ["Container", "Location", "Equipped", "Corpse", "World"];
 
     /// <returns>
-    /// Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
+    /// Lots: the expected units per (holder, class) that no geid names, at the end. A lot is a mean-field count (an
+    /// expected number, not a law): a successful Buy adds its Amount; a class move takes its expected shortfall from the
+    /// source lot, at most what it holds, into the target lot; a geid first seen on a named move out of a lot of
+    /// size L is that lot's unit with probability min(1, L), which then loses it. Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
     /// included. MeanShortfall: the expected number of units per class move that no named geid supplied.
     /// </returns>
-    public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall) Run(
+    public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall, IReadOnlyDictionary<(Holder, string), double> Lots) Run(
         IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta)
     {
         // A named move that succeeded or got no answer weighs its source, then jumps to its target; a Drop's target is
@@ -52,6 +55,15 @@ public static class NamedChains
         var steps = holders.ToDictionary(kv => kv.Key, _ => new List<(Provenance P, string Ts, Holder? Source, Func<List<Holder>, ChainStep> Kernel)>());
         var arrived = new Dictionary<(string, Holder), int>();
         var shortfalls = new List<double>();
+        var lots = new Dictionary<(Holder, string), double>();
+        var births = new Dictionary<string, (Holder Source, double Q)>();
+        double[] Prior(string geid, int k)
+        {
+            var p = new double[k];
+            p[0] = 1;
+            if (births.TryGetValue(geid, out var b)) { p[0] = 1 - b.Q; p[holders[geid].IndexOf(b.Source)] = b.Q; }
+            return p;
+        }
 
         void Apply(string geid, int seq, Provenance p, string ts, Holder? source, Holder? target, Func<List<Holder>, ChainStep> kernel)
         {
@@ -61,8 +73,22 @@ public static class NamedChains
             if (target is not null) arrived[(geid, target)] = seq;
         }
 
-        var events = named.Select(e => (e.Ts, e.Phase, e.Provenance, Run: (Action<int>)(seq => Apply(e.Geid, seq, e.Provenance, e.Ts,
-            e.Source, e.Target, h => ChainStep.Move(h.Count, At(h, e.Source), At(h, e.Target), epsilon))))).ToList();
+        var events = named.Select(e => (e.Ts, e.Phase, e.Provenance, Run: (Action<int>)(seq =>
+        {
+            if (!steps[e.Geid].Any() && e.Source is { } s0 && lots.GetValueOrDefault((s0, e.Class)) is var lot and > 0)
+            {
+                var q = Math.Min(1, lot);
+                births[e.Geid] = (s0, q);
+                lots[(s0, e.Class)] = lot - q;
+                law[e.Geid] = Prior(e.Geid, law[e.Geid].Length);
+            }
+            Apply(e.Geid, seq, e.Provenance, e.Ts, e.Source, e.Target, h => ChainStep.Move(h.Count, At(h, e.Source), At(h, e.Target), epsilon));
+        }))).ToList();
+
+        // A successful Buy: its Amount is born in the target, which already is the landing station.
+        foreach (var m in moveList.Where(m => m.MoveType == "Buy" && m.Result == "succeed" && m.Amount > 0))
+            if (TargetOf(m) is { } at)
+                events.Add((m.Ts, 0, m.Provenance, _ => lots[(at, m.ItemClass)] = lots.GetValueOrDefault((at, m.ItemClass)) + m.Amount));
 
         // A burst with the Body_ItemPort line is a complete listing: a geid that may be on the body and that the listing
         // leaves out goes from the body to Out of sight with 1 − δ.
@@ -89,7 +115,11 @@ public static class NamedChains
                     .OrderByDescending(g => arrived.GetValueOrDefault((g, s), -1)).ToList();
                 var presence = candidates.Select(g => law[g][holders[g].IndexOf(s)]).ToArray();
                 var (moved, shortfall) = ClassMoveSplit.Split(presence, (int)m.Amount);
-                shortfalls.Add(shortfall.Select((p, k) => p * k).Sum());
+                var missing = shortfall.Select((p, k) => p * k).Sum();
+                shortfalls.Add(missing);
+                var take = Math.Min(missing, lots.GetValueOrDefault((s, m.ItemClass)));
+                lots[(s, m.ItemClass)] = lots.GetValueOrDefault((s, m.ItemClass)) - take;
+                lots[(t, m.ItemClass)] = lots.GetValueOrDefault((t, m.ItemClass)) + take;
                 for (var i = 0; i < candidates.Count; i++)
                 {
                     var r = Math.Min(1, moved[i] / presence[i]);   // presence > 0: candidates hold s with some mass
@@ -106,13 +136,13 @@ public static class NamedChains
         foreach (var (geid, list) in steps)
         {
             var h = holders[geid];
-            var (predictive, smoothed) = ObjectChain.Run([1, .. new double[h.Count - 1]], [.. list.Select(e => e.Kernel(h))]);
+            var (predictive, smoothed) = ObjectChain.Run(Prior(geid, h.Count), [.. list.Select(e => e.Kernel(h))]);
             IReadOnlyDictionary<Holder, double> Law(double[] p) => h.Zip(p).ToDictionary(x => x.First, x => x.Second);
             chains[geid] = [.. list.Select((e, t) => new ChainEntry(e.P, e.Ts, e.Source,
                 t > 0 && e.Source?.Kind is "Container" or "Location" ? predictive[t][h.IndexOf(e.Source!)] : null,
                 Law(predictive[t]), Law(smoothed[t])))];
         }
-        return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average());
+        return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average(), lots);
     }
 
     // §4: a Store never names its source, which is always the player's hand or body.
