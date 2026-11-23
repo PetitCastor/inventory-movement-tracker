@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace InventoryMovementTracker.Core;
 
 /// <summary>
@@ -14,14 +16,15 @@ namespace InventoryMovementTracker.Core;
 /// <para>
 /// Arrival order at the source, most recent first, is approximated by the time of each geid's last step that targeted
 /// that source. The units the named geids do not supply (lots, carriers, Out of sight, births) are out of scope (B5);
-/// only their expected count is returned. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5),
-/// continuous hazards (B6) and resets (B7).
+/// only their expected count is returned. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5)
+/// and resets (B7). Continuous hazards (B6) apply only when <c>hazards</c> is given.
 /// </para>
 /// </summary>
 public static class NamedChains
 {
     private static readonly HashSet<string> NamedMoves = ["Store", "Interaction", "StoreItem", "Drop", "Death"];
     private static readonly HashSet<string> NotClassMoves = ["Split", "Stack", "StackAll", "Sort", "AmmoRepool", "Buy", "MoveAll"];
+    private static readonly string[] Consumables = ["Drink_", "Food_", "crlf_consumable_"];
     private static readonly HashSet<string> Sources = ["Container", "Location", "Equipped"];   // Invalid: no likelihood
     private static readonly HashSet<string> Targets = ["Container", "Location", "Equipped", "Corpse", "World"];
 
@@ -33,7 +36,7 @@ public static class NamedChains
     /// included. MeanShortfall: the expected number of units per class move that no named geid supplied.
     /// </returns>
     public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall, IReadOnlyDictionary<(Holder, string), double> Lots) Run(
-        IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta)
+        IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta, Hazards? hazards = null)
     {
         // A named move that succeeded or got no answer weighs its source, then jumps to its target; a Drop's target is
         // the floor under its key as stored. failed: nothing. lost: the source only, no jump; the §4 queue rule waits.
@@ -52,7 +55,10 @@ public static class NamedChains
             .SelectMany(e => new[] { e.Source, e.Target }).OfType<Holder>().Prepend(Holder.OutOfSight).Distinct().ToList());
         var byClass = named.GroupBy(e => e.Geid).ToLookup(g => g.First().Class, g => g.Key);
         var law = holders.ToDictionary(kv => kv.Key, kv => (double[])[1, .. new double[kv.Value.Count - 1]]);
-        var steps = holders.ToDictionary(kv => kv.Key, _ => new List<(Provenance P, string Ts, Holder? Source, Func<List<Holder>, ChainStep> Kernel)>());
+        var steps = holders.ToDictionary(kv => kv.Key, _ => new List<(Provenance P, string Ts, Holder? Source, Func<List<Holder>, ChainStep> Kernel, Func<List<Holder>, ChainStep>? Decay)>());
+        var classOf = named.GroupBy(e => e.Geid).ToDictionary(g => g.Key, g => g.First().Class);
+        var lastTs = new Dictionary<string, DateTimeOffset>();
+        var pending = new Dictionary<string, Func<List<Holder>, ChainStep>>();
         var arrived = new Dictionary<(string, Holder), int>();
         var shortfalls = new List<double>();
         var lots = new Dictionary<(Holder, string), double>();
@@ -65,11 +71,24 @@ public static class NamedChains
             return p;
         }
 
+        // B6: before a geid's step, D decays the law over the hours since its previous step (none before the first).
+        // It is stored apart so that the published predictive law is the one after D, just before the proof.
+        void Decay(string geid, string ts)
+        {
+            if (hazards is null || pending.ContainsKey(geid)) return;
+            var now = DateTimeOffset.Parse(ts, CultureInfo.InvariantCulture);
+            var hours = lastTs.TryGetValue(geid, out var last) ? (now - last).TotalHours : 0;
+            lastTs[geid] = now;
+            pending[geid] = h => DecayStep(h, hazards, classOf[geid], hours);
+            law[geid] = ObjectChain.Filter(law[geid], pending[geid](holders[geid]), $"at {ts}");
+        }
+
         void Apply(string geid, int seq, Provenance p, string ts, Holder? source, Holder? target, Func<List<Holder>, ChainStep> kernel)
         {
+            Decay(geid, ts);
             if (target is not null && !holders[geid].Contains(target)) { holders[geid].Add(target); law[geid] = [.. law[geid], 0]; }
             law[geid] = ObjectChain.Filter(law[geid], kernel(holders[geid]), $"at {ts}");
-            steps[geid].Add((p, ts, source, kernel));
+            steps[geid].Add((p, ts, source, kernel, pending.Remove(geid, out var decay) ? decay : null));
             if (target is not null) arrived[(geid, target)] = seq;
         }
 
@@ -113,6 +132,7 @@ public static class NamedChains
             {
                 var candidates = byClass[m.ItemClass].Where(g => At(holders[g], s) is { } i && law[g][i] > 0)
                     .OrderByDescending(g => arrived.GetValueOrDefault((g, s), -1)).ToList();
+                foreach (var g in candidates) Decay(g, m.Ts);   // p_o is read after D
                 var presence = candidates.Select(g => law[g][holders[g].IndexOf(s)]).ToArray();
                 var (moved, shortfall) = ClassMoveSplit.Split(presence, (int)m.Amount);
                 var missing = shortfall.Select((p, k) => p * k).Sum();
@@ -136,11 +156,13 @@ public static class NamedChains
         foreach (var (geid, list) in steps)
         {
             var h = holders[geid];
-            var (predictive, smoothed) = ObjectChain.Run(Prior(geid, h.Count), [.. list.Select(e => e.Kernel(h))]);
+            var (predictive, smoothed) = ObjectChain.Run(Prior(geid, h.Count),
+                [.. list.SelectMany(e => e.Decay is { } d ? new[] { d(h), e.Kernel(h) } : [e.Kernel(h)])]);
             IReadOnlyDictionary<Holder, double> Law(double[] p) => h.Zip(p).ToDictionary(x => x.First, x => x.Second);
+            var stride = hazards is null ? 1 : 2;   // the step's own row is the last of its (D, kernel) pair
             chains[geid] = [.. list.Select((e, t) => new ChainEntry(e.P, e.Ts, e.Source,
-                t > 0 && e.Source?.Kind is "Container" or "Location" ? predictive[t][h.IndexOf(e.Source!)] : null,
-                Law(predictive[t]), Law(smoothed[t])))];
+                t > 0 && e.Source?.Kind is "Container" or "Location" ? predictive[t * stride + stride - 1][h.IndexOf(e.Source!)] : null,
+                Law(predictive[t * stride + stride - 1]), Law(smoothed[t * stride + stride - 1])))];
         }
         return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average(), lots);
     }
@@ -156,6 +178,23 @@ public static class NamedChains
 
     private static int? At(List<Holder> holders, Holder? holder) =>
         holder is not null && holders.IndexOf(holder) is >= 0 and var i ? i : null;
+
+    // B6: staying in a holder over `hours` keeps exp(−λ·hours), the rest goes Out of sight, which never decays.
+    private static ChainStep DecayStep(List<Holder> holders, Hazards rates, string cls, double hours)
+    {
+        var m = new double[holders.Count, holders.Count];
+        var oos = holders.IndexOf(Holder.OutOfSight);
+        for (var i = 0; i < holders.Count; i++)
+        {
+            var h = holders[i];
+            var rate = h == Holder.OutOfSight ? 0 : h.Kind == "World" ? rates.Despawn
+                : h.Kind != "Location" && Consumables.Any(p => cls.StartsWith(p, StringComparison.Ordinal)) ? rates.Consumption : rates.Leak;
+            var stay = Math.Exp(-rate * hours);
+            m[i, i] += stay;
+            m[i, oos] += 1 - stay;
+        }
+        return new ChainStep(m, null);
+    }
 
     // On row `from`, stay with 1 − r or go to `to` with r. Every other state stays where it is.
     private static ChainStep Shift(List<Holder> holders, Holder from, Holder to, double r)
