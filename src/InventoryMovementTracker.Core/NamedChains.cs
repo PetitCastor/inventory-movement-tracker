@@ -22,8 +22,21 @@ namespace InventoryMovementTracker.Core;
 /// is born in the target's lot with probability <c>birth</c>; the others are asked of the carriers, then of the geids seen
 /// before that are Out of sight, in ordinal order since nothing there has a recency, and born if these lack them too. A
 /// birth is drawn before the carriers serve, so the share of births exceeds <c>birth</c>. A move without a real source is
-/// all births. Out of scope: the lost-queue rule of §4 and MoveAll (B9) and resets (B7). Continuous hazards (B6) and the
-/// game updates without a reset (B8, <c>updates</c>) apply only when <c>hazards</c> is given.
+/// all births. Out of scope: resets (B7). Continuous hazards (B6) and the game updates without a reset (B8,
+/// <c>updates</c>) apply only when <c>hazards</c> is given.
+/// </para>
+/// <para>
+/// Lost moves come in queues (§4), from the first one to the next answer, succeed or failed, or change of session. A
+/// queue proves that a source held, at its start, the most units its lost moves had asked for net of what earlier ones
+/// would have brought; the lot becomes the larger of itself and what the geids there leave of that, two laws taken as
+/// independent. Nothing moves. A move without an answer neither closes the queue nor counts in it, and an object asked
+/// for again in the queue counts each time (R27).
+/// </para>
+/// <para>
+/// A MoveAll takes from its source, with 1 − <c>epsCap</c> each, the geids, save its target and the containers that hold
+/// it, and the units of the lots. Those containers are a hard decision: the most probable holders, as of each one's last
+/// step, 6 levels up at most. What a lot sends and what it keeps are two laws, and the target's lot receives the former
+/// as if independent (R26): the means are exact, not the laws.
 /// </para>
 /// </summary>
 public static class NamedChains
@@ -33,6 +46,9 @@ public static class NamedChains
     /// absent, rather than the 42 first appearances out of 57 units. Flat between 0.95 and 0.99.
     /// </summary>
     public const double DefaultBirth = 0.97;
+
+    /// <summary>ε_cap (P0.1 §7): the chance that a MoveAll's full target leaves a unit behind. A declared choice.</summary>
+    public const double DefaultEpsCap = 0.01;
 
     private static readonly HashSet<string> NamedMoves = ["Store", "Interaction", "StoreItem", "Drop", "Death"];
     private static readonly HashSet<string> NotClassMoves = ["Split", "Stack", "StackAll", "Sort", "AmmoRepool", "Buy", "MoveAll"];
@@ -52,16 +68,17 @@ public static class NamedChains
     /// </returns>
     public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall, IReadOnlyDictionary<(Holder, string), double> Lots) Run(
         IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta, Hazards? hazards = null,
-        IReadOnlyList<DateTimeOffset>? updates = null, double birth = DefaultBirth)
+        IReadOnlyList<DateTimeOffset>? updates = null, double birth = DefaultBirth, double epsCap = DefaultEpsCap)
     {
         // A named move that succeeded or got no answer weighs its source, then jumps to its target; a Drop's target is
-        // the floor under its key as stored. failed: nothing. lost: the source only, no jump; the §4 queue rule waits.
+        // the floor under its key as stored. failed: nothing. lost: the source only, no jump, unless its queue may have filled it.
         // A seen line, placeholders aside, is named evidence: a jump to the body, or to its parent container.
         var moveList = moves.ToList();
+        var (queues, unweighed) = LostQueues(moveList);
         var seen = sightings.Where(s => !s.Placeholder).ToList();
         var named = moveList
             .Where(m => m.Geid is not null && NamedMoves.Contains(m.MoveType) && m.Result != "failed")
-            .Select(m => (Geid: m.Geid!, Class: m.ItemClass, m.Ts, Phase: 0, m.Provenance, Source: SourceOf(m),
+            .Select(m => (Geid: m.Geid!, Class: m.ItemClass, m.Ts, Phase: 0, m.Provenance, Source: unweighed.Contains(m) ? null : SourceOf(m),
                 Target: m.Result != "lost" ? TargetOf(m) : null))
             .Concat(seen.Select(s => (s.Geid, Class: s.ClassName, s.Ts, Phase: 1, s.Provenance, Source: (Holder?)null,
                 Target: (Holder?)(s.ParentGeid is { } parent ? new Holder("Container", parent) : Holder.Body))))
@@ -127,6 +144,16 @@ public static class NamedChains
             Apply(e.Geid, seq, e.Provenance, e.Ts, e.Source, e.Target, h => ChainStep.Move(h.Count, At(h, e.Source), At(h, e.Target), epsilon));
         }))).ToList();
 
+        // Before every event of the same key, since a queue bounds the stock at its start.
+        events.InsertRange(0, queues.Select(q => (q.First.Ts, 0, q.First.Provenance, (Action<int>)(_ =>
+        {
+            foreach (var ((at, cls), (_, _, k)) in q.Counts.Where(c => c.Value.Proved > 0))
+            {
+                var presence = byClass[cls].Select(g => Mass(g, at)).ToList();   // a geid without a step is Out of sight: 0
+                lots[(at, cls)] = LotLaw.Max(Lot(at, cls), ClassMoveSplit.Split(presence, k).Shortfall);
+            }
+        }))));
+
         // A successful Buy: its Amount is born in the target, which already is the landing station.
         foreach (var m in moveList.Where(m => m.MoveType == "Buy" && m.Result == "succeed" && m.Amount > 0))
             if (TargetOf(m) is { } at)
@@ -147,21 +174,40 @@ public static class NamedChains
 
         double Mass(string geid, Holder holder) => At(holders[geid], holder) is { } i ? law[geid][i] : 0;
 
-        bool Carried(Holder holder, Holder s, Holder t)
+        // The holder itself, then the most probable holder of each container.
+        IEnumerable<Holder> Up(Holder holder)
         {
             for (var hops = 0; hops <= 6; hops++)   // a cycle of containers ends here too
             {
-                if (holder == Holder.Body) return true;
-                if (holder == s || holder == t || holder.Kind != "Container" || !law.TryGetValue(holder.Key, out var p)) return false;
+                yield return holder;
+                if (holder.Kind != "Container" || !law.TryGetValue(holder.Key, out var p)) yield break;
                 holder = holders[holder.Key][Array.IndexOf(p, p.Max())];
             }
-            return false;
+        }
+
+        bool Carried(Holder holder, Holder s, Holder t) =>
+            Up(holder).TakeWhile(h => h == Holder.Body || (h != s && h != t)).Contains(Holder.Body);
+
+        foreach (var m in moveList.Where(m => m.MoveType == "MoveAll" && m.Result is null or "succeed"))
+        {
+            if (SourceOf(m) is not { } s || TargetOf(m) is not { } t || s == t) continue;
+            events.Add((m.Ts, 0, m.Provenance, seq =>
+            {
+                var up = Up(t).Where(h => h.Kind == "Container").Select(h => h.Key).ToHashSet();
+                foreach (var g in law.Keys.Where(g => !up.Contains(g) && Mass(g, s) > 0).ToList())
+                    Apply(g, seq, m.Provenance, m.Ts, null, t, h => Shift(h, [(s, 1 - epsCap)], t));
+                foreach (var (_, cls) in lots.Keys.Where(k => k.Item1 == s).ToList())
+                {
+                    var lot = Lot(s, cls);
+                    lots[(s, cls)] = LotLaw.Thin(lot, epsCap);
+                    lots[(t, cls)] = LotLaw.Add(Lot(t, cls), LotLaw.Thin(lot, 1 - epsCap));
+                }
+            }));
         }
 
         // A move by class: no geid, succeeded or no answer, n > 0 units to a real target. A candidate leaves each of its
         // places with that place's r, all in one kernel; no source likelihood, since it is not named.
-        foreach (var m in moveList.Where(m => m.Geid is null && m.Result is null or "succeed" && m.Amount > 0
-                     && !NotClassMoves.Contains(m.MoveType) && !m.MoveType.StartsWith("Query", StringComparison.Ordinal)))
+        foreach (var m in moveList.Where(m => ByClass(m) && m.Result is null or "succeed"))
         {
             if (TargetOf(m) is not { } t) continue;
             var s = SourceOf(m);   // none real: no place, so every unit is born
@@ -219,6 +265,44 @@ public static class NamedChains
                 Law(predictive[t * stride + stride - 1]), Law(smoothed[t * stride + stride - 1])))];
         }
         return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average(), lots.ToDictionary(kv => kv.Key, kv => Mean(kv.Value)));
+    }
+
+    private static bool ByClass(MoveEvidence m) => m.Geid is null && m.Amount > 0
+        && !NotClassMoves.Contains(m.MoveType) && !m.MoveType.StartsWith("Query", StringComparison.Ordinal);
+
+    // Per queue, its first lost move and, per (holder, class), the units asked of the holder, those that the queue would
+    // have brought there, and those it proves: the most asked so far less those brought before. Unweighed: the lost moves
+    // from a source that an earlier move of their queue may have filled.
+    private static (List<(MoveEvidence First, Dictionary<(Holder, string), (int Asked, int Brought, int Proved)> Counts)> Queues, HashSet<MoveEvidence> Unweighed)
+        LostQueues(List<MoveEvidence> moves)
+    {
+        var queues = new List<(MoveEvidence First, Dictionary<(Holder, string), (int Asked, int Brought, int Proved)> Counts)>();
+        var unweighed = new HashSet<MoveEvidence>();
+        var open = false;
+        foreach (var m in moves.OrderBy(m => m.Ts, StringComparer.Ordinal).ThenBy(m => m.Provenance.SessionId)
+                     .ThenBy(m => m.Provenance.LineOffset).ThenBy(m => m.Provenance.ItemIx))
+        {
+            open = open && m.Result is not ("succeed" or "failed") && m.Provenance.SessionId == queues[^1].First.Provenance.SessionId;
+            if (m.Result != "lost" || m.MoveType == "MoveAll") continue;
+            if (!open) queues.Add((m, []));
+            open = true;
+            var (s, t, cls, counts) = (SourceOf(m), TargetOf(m), m.ItemClass, queues[^1].Counts);
+            var isNamed = NamedMoves.Contains(m.MoveType) && m.Geid is not null && s is not null;
+            if (!isNamed && !(ByClass(m) && t is not null)) continue;
+            var n = isNamed ? 1 : (int)m.Amount;
+            if (s is not null)
+            {
+                var (asked, brought, proved) = counts.GetValueOrDefault((s, cls));
+                counts[(s, cls)] = (asked + n, brought, Math.Max(proved, asked + n - brought));
+                if (brought > 0) unweighed.Add(m);
+            }
+            if (t is not null)
+            {
+                var at = counts.GetValueOrDefault((t, cls));
+                counts[(t, cls)] = at with { Brought = at.Brought + n };
+            }
+        }
+        return (queues, unweighed);
     }
 
     private static double Mean(double[] law) => law.Select((p, k) => p * k).Sum();

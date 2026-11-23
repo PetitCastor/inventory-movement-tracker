@@ -19,7 +19,7 @@ public static class ResetCut
     /// </returns>
     public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, IReadOnlyList<double> MeanShortfall) Run(
         IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, IReadOnlyList<SessionEvidence> sessions,
-        double epsilon, double delta, Hazards? hazards = null, double birth = NamedChains.DefaultBirth)
+        double epsilon, double delta, Hazards? hazards = null, double birth = NamedChains.DefaultBirth, double epsCap = NamedChains.DefaultEpsCap)
     {
         var counted = sessions
             .Where(s => s.CharResetAt is not null && !sessions.Any(o => o.Build == s.Build && o.FirstLocId is not null
@@ -38,7 +38,7 @@ public static class ResetCut
         var shortfalls = new List<double>();
         for (var k = 0; k <= resets.Count; k++)
         {
-            var r = NamedChains.Run(movesBySegment[k], sightingsBySegment[k], epsilon, delta, hazards, updates, birth);
+            var r = NamedChains.Run(movesBySegment[k], sightingsBySegment[k], epsilon, delta, hazards, updates, birth, epsCap);
             foreach (var (geid, entries) in r.Chains) chains[geid] = [.. chains.GetValueOrDefault(geid, []), .. entries];
             shortfalls.Add(r.MeanShortfall);
         }

@@ -67,7 +67,7 @@ public sealed class NamedChainsHazardTests
     public void Out_of_sight_mass_does_not_decay()
     {
         // A lost move weighs its source and does not jump: the geid stays Out of sight until the next proof.
-        var chain = Run([Move(0, B, S, result: "lost"), Move(10, Hand, S)], new Hazards(1, 1, 1));
+        var chain = Run([Move(0, Hand, S, "Interaction", result: "lost"), Move(10, Hand, S)], new Hazards(1, 1, 1));
 
         Assert.Equal(1, chain[1].Predictive[Holder.OutOfSight], 1e-12);
     }
