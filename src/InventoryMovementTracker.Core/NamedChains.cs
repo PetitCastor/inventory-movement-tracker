@@ -17,7 +17,8 @@ namespace InventoryMovementTracker.Core;
 /// Arrival order at the source, most recent first, is approximated by the time of each geid's last step that targeted
 /// that source. The units the named geids do not supply (lots, carriers, Out of sight, births) are out of scope (B5);
 /// only their expected count is returned. Also out of scope: the lost-queue rule of §4 and MoveAll (B9), births (B5)
-/// and resets (B7). Continuous hazards (B6) apply only when <c>hazards</c> is given.
+/// and resets (B7). Continuous hazards (B6) and the game updates without a reset (B8, <c>updates</c>) apply only when
+/// <c>hazards</c> is given.
 /// </para>
 /// </summary>
 public static class NamedChains
@@ -36,7 +37,8 @@ public static class NamedChains
     /// included. MeanShortfall: the expected number of units per class move that no named geid supplied.
     /// </returns>
     public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, double MeanShortfall, IReadOnlyDictionary<(Holder, string), double> Lots) Run(
-        IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta, Hazards? hazards = null)
+        IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, double epsilon, double delta, Hazards? hazards = null,
+        IReadOnlyList<DateTimeOffset>? updates = null)
     {
         // A named move that succeeded or got no answer weighs its source, then jumps to its target; a Drop's target is
         // the floor under its key as stored. failed: nothing. lost: the source only, no jump; the §4 queue rule waits.
@@ -77,9 +79,11 @@ public static class NamedChains
         {
             if (hazards is null || pending.ContainsKey(geid)) return;
             var now = DateTimeOffset.Parse(ts, CultureInfo.InvariantCulture);
-            var hours = lastTs.TryGetValue(geid, out var last) ? Math.Max(0, (now - last).TotalHours) : 0;
+            var first = !lastTs.TryGetValue(geid, out var last);
+            var hours = first ? 0 : Math.Max(0, (now - last).TotalHours);
+            var u = first || updates is null ? 0 : updates.Count(x => last < x && x <= now);   // B8: ]previous step, now]
             lastTs[geid] = now;
-            pending[geid] = h => DecayStep(h, hazards, classOf[geid], hours);
+            pending[geid] = h => DecayStep(h, hazards, classOf[geid], hours, u);
             law[geid] = ObjectChain.Filter(law[geid], pending[geid](holders[geid]), $"at {ts}");
         }
 
@@ -179,8 +183,9 @@ public static class NamedChains
     private static int? At(List<Holder> holders, Holder? holder) =>
         holder is not null && holders.IndexOf(holder) is >= 0 and var i ? i : null;
 
-    // B6: staying in a holder over `hours` keeps exp(−λ·hours), the rest goes Out of sight, which never decays.
-    private static ChainStep DecayStep(List<Holder> holders, Hazards rates, string cls, double hours)
+    // B6: staying in a holder over `hours` keeps exp(−λ·hours), and B8: ρ' per game update without a reset; the rest goes
+    // Out of sight, which never decays.
+    private static ChainStep DecayStep(List<Holder> holders, Hazards rates, string cls, double hours, int updates)
     {
         var m = new double[holders.Count, holders.Count];
         var oos = holders.IndexOf(Holder.OutOfSight);
@@ -189,7 +194,7 @@ public static class NamedChains
             var h = holders[i];
             var rate = h.Kind == "World" ? rates.Despawn
                 : h.Kind != "Location" && Consumables.Any(p => cls.StartsWith(p, StringComparison.Ordinal)) ? rates.Consumption : rates.Leak;
-            var stay = Math.Exp(-rate * hours);
+            var stay = Math.Exp(-rate * hours) * Math.Pow(rates.Rho, updates);
             m[i, i] += stay;
             m[i, oos] += 1 - stay;
         }

@@ -19,12 +19,17 @@ public static class ResetCut
     /// </returns>
     public static (IReadOnlyDictionary<string, IReadOnlyList<ChainEntry>> Chains, IReadOnlyList<double> MeanShortfall) Run(
         IEnumerable<MoveEvidence> moves, IEnumerable<SightingEvidence> sightings, IReadOnlyList<SessionEvidence> sessions,
-        double epsilon, double delta)
+        double epsilon, double delta, Hazards? hazards = null)
     {
-        var resets = sessions
+        var counted = sessions
             .Where(s => s.CharResetAt is not null && !sessions.Any(o => o.Build == s.Build && o.FirstLocId is not null
-                && o.FirstTs is not null && s.FirstTs is not null && Instant(o.FirstTs) < Instant(s.FirstTs)))
-            .Select(s => Instant(s.CharResetAt!)).ToList();
+                && o.FirstTs is not null && s.FirstTs is not null && Instant(o.FirstTs) < Instant(s.FirstTs))).ToList();
+        var resets = counted.Select(s => Instant(s.CharResetAt!)).ToList();
+        // B8: in FirstTs order, a session whose build differs from the previous one's and has no counted reset is a game
+        // update at its FirstTs. Sessions without FirstTs or Build are left out.
+        var known = sessions.Where(s => s.FirstTs is not null && s.Build is not null).OrderBy(s => Instant(s.FirstTs!)).ToList();
+        var updates = known.Skip(1).Where((s, i) => s.Build != known[i].Build && counted.All(r => r.Build != s.Build))
+            .Select(s => Instant(s.FirstTs!)).ToList();
         int Segment(string ts) => resets.Count(r => r <= Instant(ts));
 
         var movesBySegment = moves.ToLookup(m => Segment(m.Ts));
@@ -33,7 +38,7 @@ public static class ResetCut
         var shortfalls = new List<double>();
         for (var k = 0; k <= resets.Count; k++)
         {
-            var r = NamedChains.Run(movesBySegment[k], sightingsBySegment[k], epsilon, delta);
+            var r = NamedChains.Run(movesBySegment[k], sightingsBySegment[k], epsilon, delta, hazards, updates);
             foreach (var (geid, entries) in r.Chains) chains[geid] = [.. chains.GetValueOrDefault(geid, []), .. entries];
             shortfalls.Add(r.MeanShortfall);
         }
