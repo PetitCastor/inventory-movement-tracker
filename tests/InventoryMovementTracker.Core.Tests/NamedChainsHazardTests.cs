@@ -58,7 +58,7 @@ public sealed class NamedChainsHazardTests
         MoveEvidence[] moves = [Move(0, Hand, W, "Drop", "Tool_x"), Move(1, W, Holder.Body, "Interaction", "Tool_x")];
 
         var before = Run(moves, null)[1].Predictive[W];
-        var after = Run(moves, new Hazards(0, 1, 0))[1].Predictive[W];
+        var after = Run(moves, new Hazards(0, 1, 0, Hangar: 0))[1].Predictive[W];
 
         Assert.Equal(Math.Exp(-1), after / before, 1e-9);
     }
