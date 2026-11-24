@@ -48,7 +48,9 @@ namespace InventoryMovementTracker.Core;
 /// step, 6 levels up at most. What a lot sends and what it keeps are two laws, and the target's lot receives the former
 /// as if independent (R26): the means are exact, not the laws. A death (R57) sends the body's lots to the corpse, those of carried
 /// containers stay; a complete listing (R58) thins by δ a body lot whose class none of its lines has; a body port taken again (R56)
-/// sends its last occupant, if it was seen nowhere since, from the body to Out of sight with 1 − δ.
+/// sends its last occupant, if it was seen nowhere since, from the body to Out of sight with 1 − δ. A complete listing also sends, with 1 − δ,
+/// the mass in k of a geid it omits whose last named line is a sight on k, if k is listed, in one step with its body mass (R64). Not evaluated:
+/// a part that reached k by a move, or whose k is not listed.
 /// </para>
 /// </summary>
 public static class NamedChains
@@ -184,8 +186,10 @@ public static class NamedChains
             if (body) occupant[s.Port] = s.Geid;
         }
 
+        var piece = new Dictionary<string, Holder?>();   // a geid's last named line with a target: its parent if that is a sight on one
         var events = named.Select(e => (e.Ts, e.Phase, e.Provenance, Run: (Action<int>)(seq =>
         {
+            if (e.Target is not null) piece[e.Geid] = e.Phase == 1 && e.Target.Kind == "Container" ? e.Target : null;
             if (e.Phase == 1 && sightOf[e.Provenance].FirstOrDefault(x => x.Geid == e.Geid) is { } sight) Reoccupy(sight, seq);
             if (e.Source is null && e.Target is { } h && lots.TryGetValue((h, e.Class), out var lot))   // R50: an arrival may be a unit of the lot there
             {
@@ -237,8 +241,15 @@ public static class NamedChains
             var listed = burst.Select(s => s.Geid).ToHashSet();
             events.Add((body.Ts, 1, body.Provenance, seq =>
             {
-                foreach (var geid in law.Keys.Where(g => !listed.Contains(g) && At(holders[g], Holder.Body) is { } b && law[g][b] > 0).ToList())
-                    Apply(geid, seq, body.Provenance, body.Ts, null, null, h => Shift(h, [(Holder.Body, 1 - delta)], Holder.OutOfSight), Lines(body.Provenance));
+                foreach (var geid in law.Keys.Where(g => !listed.Contains(g)).ToList())
+                {   // one step per geid: the body, and k if it is a part of k, k is listed and it has mass there (the first line of k is read)
+                    var parent = piece.GetValueOrDefault(geid);
+                    var first = burst.Where(s => s.Geid == parent?.Key).MinBy(s => (s.Provenance.LineOffset, s.Provenance.ItemIx));
+                    var rows = new[] { Holder.Body, first is null ? null : parent }.OfType<Holder>().Where(h => Mass(geid, h) > 0).ToList();
+                    if (rows.Count > 0)
+                        Apply(geid, seq, body.Provenance, body.Ts, null, null, h => Shift(h, rows.Select(r => (r, 1 - delta)), Holder.OutOfSight),
+                            Lines(new[] { body.Provenance, rows.Contains(parent!) ? first?.Provenance : null }.OfType<Provenance>()));
+                }
                 // R58: a lot on the body whose class no line of the burst has keeps each unit with δ; the rest is lost.
                 foreach (var (at, cls) in lots.Keys.Where(k => k.Item1 == Holder.Body).ToList())
                 {
