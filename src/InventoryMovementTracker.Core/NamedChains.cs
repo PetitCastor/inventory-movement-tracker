@@ -46,7 +46,9 @@ namespace InventoryMovementTracker.Core;
 /// A MoveAll takes from its source, with 1 − <c>epsCap</c> each, the geids, save its target and the containers that hold
 /// it, and the units of the lots. Those containers are a hard decision: the most probable holders, as of each one's last
 /// step, 6 levels up at most. What a lot sends and what it keeps are two laws, and the target's lot receives the former
-/// as if independent (R26): the means are exact, not the laws.
+/// as if independent (R26): the means are exact, not the laws. A death (R57) sends the body's lots to the corpse, those of carried
+/// containers stay; a complete listing (R58) thins by δ a body lot whose class none of its lines has; a body port taken again (R56)
+/// sends its last occupant, if it was seen nowhere since, from the body to Out of sight with 1 − δ.
 /// </para>
 /// </summary>
 public static class NamedChains
@@ -163,8 +165,28 @@ public static class NamedChains
             if (target is not null) arrived[(geid, target)] = seq;
         }
 
+        // R56: a sight on a body port sends its last other occupant, if its last port was this one, to Out of sight, unless o is in g's burst
+        // or the burst is a complete listing, which has evicted o. Every sight sets a last port, none with a parent. E[o] reads these lines.
+        var bursts = seen.ToLookup(s => (s.Provenance.SessionId, s.BurstId));
+        var sightOf = seen.ToLookup(s => s.Provenance);
+        var (lastPort, occupant) = (new Dictionary<string, string?>(), new Dictionary<string, string>());
+        void Reoccupy(SightingEvidence s, int seq)
+        {
+            var body = s.ParentGeid is null && BodyPort(s.Port);
+            if (body && occupant.TryGetValue(s.Port, out var o) && o != s.Geid)
+            {
+                var same = bursts[(s.Provenance.SessionId, s.BurstId)].Where(x => x.Geid == o || x.Port == "Body_ItemPort").ToList();
+                foreach (var x in same.Append(s)) E(null, o)[rank[x.Provenance]] = true;
+                if (same.Count == 0 && lastPort[o] == s.Port && Mass(o, Holder.Body) > 0)
+                    Apply(o, seq, s.Provenance, s.Ts, null, null, h => Shift(h, [(Holder.Body, 1 - delta)], Holder.OutOfSight), Lines(s.Provenance));
+            }
+            lastPort[s.Geid] = s.ParentGeid is null ? s.Port : null;
+            if (body) occupant[s.Port] = s.Geid;
+        }
+
         var events = named.Select(e => (e.Ts, e.Phase, e.Provenance, Run: (Action<int>)(seq =>
         {
+            if (e.Phase == 1 && sightOf[e.Provenance].FirstOrDefault(x => x.Geid == e.Geid) is { } sight) Reoccupy(sight, seq);
             if (e.Source is null && e.Target is { } h && lots.TryGetValue((h, e.Class), out var lot))   // R50: an arrival may be a unit of the lot there
             {
                 Decay(e.Geid, e.Ts);   // m is read after D; Out of sight is 1 at the first proof
@@ -217,6 +239,40 @@ public static class NamedChains
             {
                 foreach (var geid in law.Keys.Where(g => !listed.Contains(g) && At(holders[g], Holder.Body) is { } b && law[g][b] > 0).ToList())
                     Apply(geid, seq, body.Provenance, body.Ts, null, null, h => Shift(h, [(Holder.Body, 1 - delta)], Holder.OutOfSight), Lines(body.Provenance));
+                // R58: a lot on the body whose class no line of the burst has keeps each unit with δ; the rest is lost.
+                foreach (var (at, cls) in lots.Keys.Where(k => k.Item1 == Holder.Body).ToList())
+                {
+                    var held = burst.Where(s => s.ClassName == cls).MinBy(s => (s.Provenance.LineOffset, s.Provenance.ItemIx));
+                    E(at, cls)[rank[body.Provenance]] = true;
+                    if (held is null) lots[(at, cls)] = LotLaw.Thin(lots[(at, cls)], delta);
+                    else E(at, cls).Or(E(null, held.Geid))[rank[held.Provenance]] = true;
+                }
+            }));
+        }
+
+        // R57: a run of Death lines of one corpse and session, under 5 s apart (failed and lost ones are no evidence). Before each of its
+        // steps the body's lots read its last line if it spans under 5 s (a subset with it is the same death), else all; after, they go to the corpse.
+        double Seconds(MoveEvidence from, MoveEvidence to) =>
+            (DateTimeOffset.Parse(to.Ts, CultureInfo.InvariantCulture) - DateTimeOffset.Parse(from.Ts, CultureInfo.InvariantCulture)).TotalSeconds;
+        var groups = new List<List<MoveEvidence>>();
+        foreach (var m in moveList.Where(m => m.MoveType == "Death" && m.Result is not ("failed" or "lost") && TargetOf(m) is { Kind: "Corpse" })
+                     .OrderBy(m => m.Ts, StringComparer.Ordinal).ThenBy(m => m.Provenance.SessionId).ThenBy(m => m.Provenance.LineOffset).ThenBy(m => m.Provenance.ItemIx))
+            if (groups.Count > 0 && groups[^1][^1] is var p && p.Provenance.SessionId == m.Provenance.SessionId && TargetOf(p) == TargetOf(m)
+                && Seconds(p, m) < 5) groups[^1].Add(m);
+            else groups.Add([m]);
+        foreach (var group in groups)
+        {
+            var last = group[^1];
+            var all = Lines(group.Skip(Seconds(group[0], last) < 5 ? group.Count - 1 : 0).Select(m => m.Provenance));
+            foreach (var m in group)
+                events.Insert(0, (m.Ts, 0, m.Provenance, _ => { foreach (var (at, cls) in lots.Keys.Where(k => k.Item1 == Holder.Body)) E(at, cls).Or(all); }));
+            events.Add((last.Ts, 0, last.Provenance, _ =>
+            {
+                foreach (var (at, cls) in lots.Keys.Where(k => k.Item1 == Holder.Body).ToList())
+                {
+                    lots[(TargetOf(last)!, cls)] = LotLaw.Add(Lot(TargetOf(last)!, cls), lots[(at, cls)]);
+                    lots[(at, cls)] = [1];
+                }
             }));
         }
 
@@ -337,6 +393,9 @@ public static class NamedChains
         }
         return (chains, shortfalls.Count == 0 ? 0 : shortfalls.Average(), lots.ToDictionary(kv => kv.Key, kv => Mean(kv.Value)));
     }
+
+    private static bool BodyPort(string port) =>
+        port.StartsWith("Armor_", StringComparison.Ordinal) || port.StartsWith("wep_stocked_", StringComparison.Ordinal) || port is "backpack" or "wep_sidearm";
 
     private static bool ByClass(MoveEvidence m) => m.Geid is null && m.Amount > 0
         && !NotClassMoves.Contains(m.MoveType) && !m.MoveType.StartsWith("Query", StringComparison.Ordinal);
