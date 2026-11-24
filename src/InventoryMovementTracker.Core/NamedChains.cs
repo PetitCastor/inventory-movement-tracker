@@ -27,6 +27,15 @@ namespace InventoryMovementTracker.Core;
 /// <c>updates</c>) apply only when <c>hazards</c> is given.
 /// </para>
 /// <para>
+/// An arrival (R50), a named proof with no weighed source (a sight, a StoreItem, a named move whose source is not weighed) at
+/// a real holder h, may be a unit of the lot (h, c) already there: just before its jump, with m = P(Out of sight), read after D
+/// and 1 at its first proof, the lot loses a unit with probability m (<see cref="LotLaw.Take"/>), at each arrival in order. The
+/// geid's law does not change. A named move whose source is weighed never takes from its target (R51). The lot's evidence
+/// receives the geid's list and the line (E5), even if the lot is empty or m = 0. Limits: a geid at the body that D makes
+/// leave (m &gt; 0) and is seen again takes a unit wrongly; identity is not weighed among the geids of the class Out of sight, the
+/// first one seen takes the unit; the geid's smoothed history does not say it was the unit.
+/// </para>
+/// <para>
 /// Lost moves come in queues (§4), from the first one to the next answer, succeed or failed, or change of session. A
 /// queue proves that a source held, at its start, the most units its lost moves had asked for net of what earlier ones
 /// would have brought; the lot becomes the larger of itself and what the geids there leave of that, two laws taken as
@@ -61,7 +70,8 @@ public static class NamedChains
     /// Lots: the mean, at the end, of the law of the units per (holder, class) that no geid names. A successful Buy
     /// shifts that law by its Amount; a class move takes T = min(K, L) from each lot L of its places, K being the units the
     /// places before it leave wanted, and adds T and its births to the target lot; a geid first seen on a named move out of a lot is that lot's unit with P(L ≥ 1), and the
-    /// lot becomes max(0, L − 1). This is an approximation: K and L, and the target lot and each T, are taken as independent,
+    /// lot becomes max(0, L − 1); an arrival with no weighed source takes a unit of the lot at its target with its m
+    /// (R50, R51). This is an approximation: K and L, and the target lot and each T, are taken as independent,
     /// though one class move shares its units between the geids and the lots; adding several T and the births, as if independent, keeps
     /// the target lot's mean exact, not its law (n = 3 and a source lot of 0 or 1 unit, 0.5 each: the gain is 3, the sum gives
     /// 2, 3 and 4 with 0.25, 0.5 and 0.25). Chains: each geid's steps in evidence order (by ts, then moves before listings, then provenance), class moves
@@ -155,6 +165,13 @@ public static class NamedChains
 
         var events = named.Select(e => (e.Ts, e.Phase, e.Provenance, Run: (Action<int>)(seq =>
         {
+            if (e.Source is null && e.Target is { } h && lots.TryGetValue((h, e.Class), out var lot))   // R50: an arrival may be a unit of the lot there
+            {
+                Decay(e.Geid, e.Ts);   // m is read after D; Out of sight is 1 at the first proof
+                var m = law[e.Geid][0];
+                lots[(h, e.Class)] = LotLaw.Take([1 - m, m], lot).Left;
+                E(h, e.Class).Or(E(null, e.Geid))[rank[e.Provenance]] = true;   // E5: even an empty lot, even m = 0
+            }
             if (!steps[e.Geid].Any() && e.Source is { } at) E(null, e.Geid).Or(E(at, e.Class));   // an empty lot is read too
             if (!steps[e.Geid].Any() && e.Source is { } s0 && 1 - Lot(s0, e.Class)[0] is var q and > 0)
             {
