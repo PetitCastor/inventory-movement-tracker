@@ -173,23 +173,26 @@ public static class NamedChains
             if (hazards is not null) arrivedAt[(geid, target)] = lastTs[geid];
         }
 
-        // R56: a sight on a body port sends its last other occupant, if its last port was this one, to Out of sight, unless o is in g's burst
-        // or the burst is a complete listing, which has evicted o. Every sight sets a last port, none with a parent. E[o] reads these lines.
+        // R56, R73: a sight on a port, keyed by (parent, name), sends its last other occupant, if its last port was this one, from the body or from the
+        // parent to Out of sight, unless o is in g's burst or the burst is a complete listing, which has evicted o. Every sight sets a last port.
+        // Without a parent only the body's ports have an occupant. E[o] reads these lines.
         var bursts = seen.ToLookup(s => (s.Provenance.SessionId, s.BurstId));
         var sightOf = seen.ToLookup(s => s.Provenance);
-        var (lastPort, occupant) = (new Dictionary<string, string?>(), new Dictionary<string, string>());
+        var (lastPort, occupant) = (new Dictionary<string, (string?, string)>(), new Dictionary<(string?, string), string>());
         void Reoccupy(SightingEvidence s, int seq)
         {
-            var body = s.ParentGeid is null && BodyPort(s.Port);
-            if (body && occupant.TryGetValue(s.Port, out var o) && o != s.Geid)
+            var key = (s.ParentGeid, s.Port);
+            var held = s.ParentGeid is { } k ? new Holder("Container", k) : Holder.Body;
+            var port = s.ParentGeid is not null || BodyPort(s.Port);
+            if (port && occupant.TryGetValue(key, out var o) && o != s.Geid)
             {
                 var same = bursts[(s.Provenance.SessionId, s.BurstId)].Where(x => x.Geid == o || x.Port == "Body_ItemPort").ToList();
                 foreach (var x in same.Append(s)) E(null, o)[rank[x.Provenance]] = true;
-                if (same.Count == 0 && lastPort[o] == s.Port && Mass(o, Holder.Body) > 0)
-                    Apply(o, seq, s.Provenance, s.Ts, null, null, h => Shift(h, [(Holder.Body, 1 - delta)], Holder.OutOfSight), Lines(s.Provenance));
+                if (same.Count == 0 && lastPort[o] == key && Mass(o, held) > 0)
+                    Apply(o, seq, s.Provenance, s.Ts, null, null, h => Shift(h, [(held, 1 - delta)], Holder.OutOfSight), Lines(s.Provenance));
             }
-            lastPort[s.Geid] = s.ParentGeid is null ? s.Port : null;
-            if (body) occupant[s.Port] = s.Geid;
+            lastPort[s.Geid] = key;
+            if (port) occupant[key] = s.Geid;
         }
 
         var piece = new Dictionary<string, Holder?>();   // a geid's last named line with a target: its parent if that is a sight on one
