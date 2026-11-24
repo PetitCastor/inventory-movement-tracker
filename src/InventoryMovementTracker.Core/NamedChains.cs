@@ -126,6 +126,7 @@ public static class NamedChains
         var lastTs = new Dictionary<string, DateTimeOffset>();
         var pending = new Dictionary<string, Func<List<Holder>, ChainStep>>();
         var arrived = new Dictionary<(string, Holder), int>();
+        var arrivedAt = new Dictionary<(string, Holder), DateTimeOffset>();   // E8: when a geid last arrived at a holder (floor ages)
         var shortfalls = new List<double>();
         var lots = new Dictionary<(Holder, string), double[]>();
         double[] Lot(Holder holder, string cls) => lots.GetValueOrDefault((holder, cls), [1]);   // no lot: 0 units
@@ -148,7 +149,10 @@ public static class NamedChains
             var hours = first ? 0 : Math.Max(0, (now - last).TotalHours);
             var u = first || updates is null ? 0 : updates.Count(x => last < x && x <= now);   // B8: ]previous step, now]
             lastTs[geid] = now;
-            pending[geid] = h => DecayStep(h, hazards, classOf[geid], hours, u);
+            // E8: each floor's age at the previous step, since the arrival there
+            var age = holders[geid].Where(h => h.Kind == "World")
+                .ToDictionary(h => h, h => arrivedAt.TryGetValue((geid, h), out var at) ? Math.Max(0, (last - at).TotalHours) : 0);
+            pending[geid] = h => DecayStep(h, hazards, classOf[geid], hours, u, age);
             law[geid] = ObjectChain.Filter(law[geid], pending[geid](holders[geid]), $"at {ts}");
         }
 
@@ -164,7 +168,9 @@ public static class NamedChains
             law[geid] = ObjectChain.Filter(law[geid], kernel(holders[geid]), $"at {ts}");
             E(null, geid).Or(read);
             steps[geid].Add((p, ts, source, kernel, pending.Remove(geid, out var decay) ? decay : null, new BitArray(E(null, geid))));
-            if (target is not null) arrived[(geid, target)] = seq;
+            if (target is null) return;
+            arrived[(geid, target)] = seq;
+            if (hazards is not null) arrivedAt[(geid, target)] = lastTs[geid];
         }
 
         // R56: a sight on a body port sends its last other occupant, if its last port was this one, to Out of sight, unless o is in g's burst
@@ -467,8 +473,9 @@ public static class NamedChains
         holder is not null && holders.IndexOf(holder) is >= 0 and var i ? i : null;
 
     // B6: staying in a holder over `hours` keeps exp(−λ·hours), and B8: ρ' per game update without a reset; the rest goes
-    // Out of sight, which never decays.
-    private static ChainStep DecayStep(List<Holder> holders, Hazards rates, string cls, double hours, int updates)
+    // Out of sight, which never decays. On the floor (E8) only the share 1 − w despawns: S(a + Δ) / S(a), S(x) = w + (1 − w)·e^(−λx), a the age
+    // at the previous step; w = 0 is e^(−λΔ) itself, since the ratio is 0/0 past about 745 h.
+    private static ChainStep DecayStep(List<Holder> holders, Hazards rates, string cls, double hours, int updates, Dictionary<Holder, double> ages)
     {
         var m = new double[holders.Count, holders.Count];
         var oos = holders.IndexOf(Holder.OutOfSight);
@@ -477,7 +484,10 @@ public static class NamedChains
             var h = holders[i];
             var rate = h.Kind == "World" ? rates.Despawn
                 : h.Kind != "Location" && Consumables.Any(p => cls.StartsWith(p, StringComparison.Ordinal)) ? rates.Consumption : rates.Leak;
-            var stay = Math.Exp(-rate * hours) * Math.Pow(rates.Rho, updates);
+            double S(double x) => rates.Hangar + (1 - rates.Hangar) * Math.Exp(-rate * x);
+            var a = ages.GetValueOrDefault(h);
+            var kept = h.Kind == "World" && rates.Hangar > 0 ? S(a + hours) / S(a) : Math.Exp(-rate * hours);
+            var stay = kept * Math.Pow(rates.Rho, updates);
             m[i, i] += stay;
             m[i, oos] += 1 - stay;
         }
