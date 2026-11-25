@@ -8,8 +8,9 @@ namespace InventoryMovementTracker.Core;
 /// B9b. A geid's states are the holders its own evidence names, plus Out of sight, where it starts, plus the targets
 /// of the class moves it may have followed.
 /// <para>
-/// A move by class (no geid) is split with <see cref="ClassMoveSplit"/> among the named geids of its class that may be
-/// at its source, on a carrier or Out of sight, so it needs every geid's current filter at once: one online forward pass
+/// A move by class (no geid; a Stack too, between two different real places, R87) is split with
+/// <see cref="ClassMoveSplit"/> among the named geids of its class that may be at its source, on a carrier or Out of sight, so it needs
+/// every geid's current filter at once: one online forward pass
 /// runs over all the evidence in time order and fixes each class move's kernels there. Each chain is then smoothed with those kernels as
 /// they are. This frozen coupling is the approximation of decision B1, constraint 3: what a later step teaches about
 /// one geid does not revise how an earlier class move was shared with the others.
@@ -417,8 +418,8 @@ public static class NamedChains
     private static bool BodyPort(string port) =>
         port.StartsWith("Armor_", StringComparison.Ordinal) || port.StartsWith("wep_stocked_", StringComparison.Ordinal) || port is "backpack" or "wep_sidearm";
 
-    private static bool ByClass(MoveEvidence m) => m.Geid is null && m.Amount > 0
-        && !NotClassMoves.Contains(m.MoveType) && !m.MoveType.StartsWith("Query", StringComparison.Ordinal);
+    private static bool ByClass(MoveEvidence m) => m.Geid is null && m.Amount > 0 && !m.MoveType.StartsWith("Query", StringComparison.Ordinal)
+        && (m.MoveType == "Stack" ? SourceOf(m) is { } s && TargetOf(m) is { } t && s != t : !NotClassMoves.Contains(m.MoveType));
 
     // Per queue, its first lost move and, per (holder, class), the units asked of the holder, those that the queue would
     // have brought there, and those it proves: the most asked so far less those brought before. Lines: the line that
